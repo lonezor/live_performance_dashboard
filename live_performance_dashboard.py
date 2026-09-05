@@ -425,6 +425,27 @@ def draw_centered_text(
     context.show_text(text)
 
 
+def draw_visually_centered_text(
+    context: cairo.Context,
+    text: str,
+    center_x: float,
+    center_y: float,
+    size: float,
+    color: Color,
+    weight: int = cairo.FONT_WEIGHT_NORMAL,
+) -> None:
+    """Center text using its rendered ink bounds on both axes."""
+    context.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, weight)
+    context.set_font_size(size)
+    x_bearing, y_bearing, text_width, text_height, _, _ = context.text_extents(text)
+    context.set_source_rgb(*color)
+    context.move_to(
+        center_x - text_width / 2.0 - x_bearing,
+        center_y - text_height / 2.0 - y_bearing,
+    )
+    context.show_text(text)
+
+
 def finite_number(value: object, minimum: float = 0.0) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("expected number")
@@ -1047,23 +1068,22 @@ class HeatmapWindow(Gtk.Window):
         label_x = panel_x + panel_width * 0.10
         bar_x = panel_x + panel_width * 0.20
         bar_width = panel_width * 0.34
+        bar_y = panel_y + panel_height * 0.29
+        bar_height = panel_height * 0.22
+        bar_center_y = bar_y + bar_height / 2.0
 
-        draw_centered_text(
-            context, "DISK I/O", label_x, panel_y + panel_height * 0.39,
+        draw_visually_centered_text(
+            context, "DISK I/O", label_x, bar_center_y,
             label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
         )
-        draw_centered_text(
-            context, self.disk_device_name, label_x,
-            panel_y + panel_height * 0.61, device_size, (0.32, 0.37, 0.46),
-        )
         self.draw_usage_bar(
-            context, bar_x, panel_y + panel_height * 0.29, bar_width,
-            panel_height * 0.22, self.displayed_disk_usage,
+            context, bar_x, bar_y, bar_width,
+            bar_height, self.displayed_disk_usage,
             bar_heat_color(self.displayed_disk_usage), (0.065, 0.070, 0.082),
         )
-        draw_centered_text(
+        draw_visually_centered_text(
             context, f"{self.displayed_disk_usage * 100.0:.0f}%",
-            panel_x + panel_width * 0.59, panel_y + panel_height * 0.46,
+            panel_x + panel_width * 0.59, bar_center_y,
             value_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
         )
 
@@ -1081,6 +1101,14 @@ class HeatmapWindow(Gtk.Window):
                 panel_y + panel_height * 0.57, detail_size,
                 (0.52, 0.56, 0.65), cairo.FONT_WEIGHT_BOLD,
             )
+
+        draw_centered_text(
+            context, self.disk_device_name,
+            panel_x + panel_width * 0.82,
+            panel_y + panel_height * 0.86,
+            device_size,
+            (0.32, 0.37, 0.46),
+        )
 
     def draw_network_panel(
         self,
