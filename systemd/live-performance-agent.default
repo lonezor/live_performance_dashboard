@@ -1,0 +1,5 @@
+# Address of the computer displaying the dashboard.
+DASHBOARD_ENDPOINT=192.168.1.100:9177
+
+# Remote sampling/transmission interval.
+INTERVAL_MS=50

@@ -8,8 +8,11 @@ import glob
 import json
 import math
 import os
+import socket
+import socketserver
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -422,6 +425,111 @@ def draw_centered_text(
     context.show_text(text)
 
 
+def finite_number(value: object, minimum: float = 0.0) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("expected number")
+    number = float(value)
+    if not math.isfinite(number) or number < minimum:
+        raise ValueError("invalid number")
+    return number
+
+
+def normalize_remote_snapshot(payload: object) -> Dict[str, object]:
+    """Validate and normalize a version-1 remote metrics snapshot."""
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("unsupported payload")
+    cpu = payload.get("cpu")
+    memory = payload.get("memory")
+    disk = payload.get("disk")
+    network = payload.get("network")
+    if not isinstance(cpu, list) or not 1 <= len(cpu) <= 4096:
+        raise ValueError("invalid CPU list")
+    if not all(isinstance(section, dict) for section in (memory, disk, network)):
+        raise ValueError("invalid metric section")
+
+    hostname = str(payload.get("hostname", "remote"))[:64]
+    device = str(disk.get("device", "REMOTE DISK"))[:64]
+    interface = str(network.get("interface", "REMOTE INTERFACE"))[:64]
+    link_value = network.get("link_bits_per_second")
+    link_speed = None if link_value is None else finite_number(link_value)
+    return {
+        "hostname": hostname,
+        "cpu": [clamp01(finite_number(value)) for value in cpu],
+        "memory_usage": clamp01(finite_number(memory.get("usage", 0.0))),
+        "memory_total_bytes": finite_number(memory.get("total_bytes", 0.0)),
+        "swap_usage": clamp01(finite_number(memory.get("swap_usage", 0.0))),
+        "swap_total_bytes": finite_number(memory.get("swap_total_bytes", 0.0)),
+        "disk_usage": clamp01(finite_number(disk.get("usage", 0.0))),
+        "disk_read": finite_number(disk.get("read_bytes_per_second", 0.0)),
+        "disk_write": finite_number(disk.get("write_bytes_per_second", 0.0)),
+        "disk_device": device,
+        "download": finite_number(network.get("download_bits_per_second", 0.0)),
+        "upload": finite_number(network.get("upload_bits_per_second", 0.0)),
+        "network_interface": interface,
+        "link_capacity": link_speed,
+    }
+
+
+class RemoteMetricsServer:
+    MAX_MESSAGE_BYTES = 64 * 1024
+
+    def __init__(self, address: str, port: int) -> None:
+        self.lock = threading.Lock()
+        self.snapshots: Dict[str, Tuple[Dict[str, object], float]] = {}
+        owner = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self) -> None:
+                while True:
+                    line = self.rfile.readline(owner.MAX_MESSAGE_BYTES + 1)
+                    if not line or len(line) > owner.MAX_MESSAGE_BYTES:
+                        return
+                    try:
+                        snapshot = normalize_remote_snapshot(json.loads(line))
+                    except (ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+                        continue
+                    with owner.lock:
+                        source_key = f"remote:{snapshot['hostname']}"
+                        owner.snapshots[source_key] = (snapshot, time.monotonic())
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self.server = Server((address, port), Handler)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            name="remote-metrics-listener",
+            daemon=True,
+        )
+        self.thread.start()
+        print(f"Listening for remote metrics on {address}:{port}", flush=True)
+
+    def active(
+        self, maximum_age: float
+    ) -> List[Tuple[str, Dict[str, object], float]]:
+        with self.lock:
+            now = time.monotonic()
+            stale = [
+                key
+                for key, (_, received_at) in self.snapshots.items()
+                if now - received_at > maximum_age
+            ]
+            for key in stale:
+                del self.snapshots[key]
+            return sorted(
+                (
+                    (key, snapshot, received_at)
+                    for key, (snapshot, received_at) in self.snapshots.items()
+                ),
+                key=lambda item: item[2],
+            )
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
 def discover_sway_socket() -> Optional[str]:
     configured = os.environ.get("SWAYSOCK")
     if configured and os.path.exists(configured):
@@ -471,6 +579,10 @@ def choose_target_output(outputs: Sequence[dict], requested: Optional[str]) -> O
 class Settings:
     output: Optional[str]
     network_interface: Optional[str]
+    listen_address: str
+    listen_port: int
+    remote_timeout: float
+    local_only: bool
     windowed: bool
     fps: float
     sample_seconds: float
@@ -486,16 +598,26 @@ class HeatmapWindow(Gtk.Window):
         self.set_wmclass("live-performance-dashboard", "LivePerformanceDashboard")
         self.set_decorated(False)
         self.set_default_size(960, 360)
-        self.connect("destroy", Gtk.main_quit)
+        self.connect("destroy", self.on_destroy)
         self.connect("key-press-event", self.on_key_press)
 
         self.canvas = Gtk.DrawingArea()
         self.canvas.connect("draw", self.on_draw)
+        self.canvas.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.canvas.connect("button-press-event", self.on_canvas_click)
         self.add(self.canvas)
 
         self.sampler = CpuLoadSampler()
         self.network_sampler = NetworkRateSampler(settings.network_interface)
         self.system_sampler = SystemUsageSampler()
+        self.remote_server: Optional[RemoteMetricsServer] = None
+        if not settings.local_only:
+            try:
+                self.remote_server = RemoteMetricsServer(
+                    settings.listen_address, settings.listen_port
+                )
+            except OSError as error:
+                print(f"Remote listener unavailable: {error}; using local metrics", file=sys.stderr)
         cpu_count = max(1, len(self.sampler.previous))
         self.target_loads = [0.0] * cpu_count
         self.displayed_loads = [0.0] * cpu_count
@@ -513,6 +635,19 @@ class HeatmapWindow(Gtk.Window):
         self.displayed_disk_usage = 0.0
         self.displayed_disk_read = 0.0
         self.displayed_disk_write = 0.0
+        self.memory_total_bytes = self.system_sampler.memory_total_bytes
+        self.swap_total_bytes = self.system_sampler.swap_total_bytes
+        self.disk_device_name = self.system_sampler.device_name
+        self.network_interface_name = self.network_sampler.interface or "NO DEFAULT ROUTE"
+        self.negotiated_link_capacity = self.network_sampler.negotiated_capacity
+        self.effective_link_capacity = self.network_sampler.link_capacity
+        self.local_hostname = socket.gethostname()
+        self.source_hostname = self.local_hostname
+        self.local_source_key = f"local:{self.local_hostname}"
+        self.active_source_key = self.local_source_key
+        self.selected_source_key: Optional[str] = None
+        self.remote_sources: List[Tuple[str, str]] = []
+        self.source_tab_hitboxes: List[Tuple[float, float, float, float, str]] = []
         self.last_frame_time = time.monotonic()
         self.placed_output: Optional[str] = None
 
@@ -532,15 +667,93 @@ class HeatmapWindow(Gtk.Window):
         if event.keyval in (Gdk.KEY_Escape, Gdk.KEY_q, Gdk.KEY_Q):
             self.close()
             return True
+        if event.keyval == Gdk.KEY_Tab:
+            direction = -1 if event.state & Gdk.ModifierType.SHIFT_MASK else 1
+            self.cycle_source(direction)
+            return True
         return False
 
-    def sample_cpu_load(self) -> bool:
-        sampled = self.sampler.sample()
+    def source_keys(self) -> List[str]:
+        return [self.local_source_key] + [key for key, _ in self.remote_sources]
+
+    def cycle_source(self, direction: int) -> None:
+        keys = self.source_keys()
+        if not keys:
+            return
+        current = self.active_source_key if self.active_source_key in keys else keys[0]
+        self.selected_source_key = keys[(keys.index(current) + direction) % len(keys)]
+
+    def on_canvas_click(self, _canvas: Gtk.DrawingArea, event: Gdk.EventButton) -> bool:
+        for x, y, width, height, source_key in self.source_tab_hitboxes:
+            if x <= event.x <= x + width and y <= event.y <= y + height:
+                self.selected_source_key = source_key
+                return True
+        return False
+
+    def on_destroy(self, _window: Gtk.Window) -> None:
+        if self.remote_server is not None:
+            self.remote_server.close()
+        Gtk.main_quit()
+
+    def set_cpu_targets(self, sampled: List[float]) -> None:
         if len(sampled) != len(self.target_loads):
             self.target_loads = sampled
             self.displayed_loads = [0.0] * len(sampled)
         else:
             self.target_loads = sampled
+
+    def apply_remote_snapshot(
+        self, source_key: str, snapshot: Dict[str, object]
+    ) -> None:
+        self.set_cpu_targets(snapshot["cpu"])  # type: ignore[arg-type]
+        self.target_memory_usage = float(snapshot["memory_usage"])
+        self.memory_total_bytes = float(snapshot["memory_total_bytes"])
+        self.target_swap_usage = float(snapshot["swap_usage"])
+        self.swap_total_bytes = float(snapshot["swap_total_bytes"])
+        self.target_disk_usage = float(snapshot["disk_usage"])
+        self.target_disk_read = float(snapshot["disk_read"])
+        self.target_disk_write = float(snapshot["disk_write"])
+        self.disk_device_name = str(snapshot["disk_device"])
+        self.target_download = float(snapshot["download"])
+        self.target_upload = float(snapshot["upload"])
+        self.network_interface_name = str(snapshot["network_interface"])
+        link_capacity = snapshot["link_capacity"]
+        self.negotiated_link_capacity = (
+            None if link_capacity is None else float(link_capacity)
+        )
+        self.effective_link_capacity = self.negotiated_link_capacity or 1_000_000_000.0
+        self.source_hostname = str(snapshot["hostname"])
+        self.active_source_key = source_key
+
+    def sample_cpu_load(self) -> bool:
+        active_remotes: List[Tuple[str, Dict[str, object], float]] = []
+        if self.remote_server is not None:
+            active_remotes = self.remote_server.active(self.settings.remote_timeout)
+        self.remote_sources = [
+            (key, str(snapshot["hostname"]))
+            for key, snapshot, _ in active_remotes
+        ]
+        remote_by_key = {
+            key: snapshot for key, snapshot, _ in active_remotes
+        }
+
+        if self.selected_source_key and self.selected_source_key != self.local_source_key:
+            selected_remote = remote_by_key.get(self.selected_source_key)
+            if selected_remote is not None:
+                self.apply_remote_snapshot(self.selected_source_key, selected_remote)
+                return True
+            self.selected_source_key = self.local_source_key
+        elif self.selected_source_key is None and active_remotes:
+            if self.active_source_key in remote_by_key:
+                source_key = self.active_source_key
+                snapshot = remote_by_key[source_key]
+            else:
+                source_key, snapshot, _ = active_remotes[-1]
+            self.apply_remote_snapshot(source_key, snapshot)
+            return True
+
+        sampled = self.sampler.sample()
+        self.set_cpu_targets(sampled)
         self.target_download, self.target_upload = self.network_sampler.sample()
         (
             self.target_memory_usage,
@@ -549,6 +762,14 @@ class HeatmapWindow(Gtk.Window):
             self.target_disk_read,
             self.target_disk_write,
         ) = self.system_sampler.sample()
+        self.memory_total_bytes = self.system_sampler.memory_total_bytes
+        self.swap_total_bytes = self.system_sampler.swap_total_bytes
+        self.disk_device_name = self.system_sampler.device_name
+        self.network_interface_name = self.network_sampler.interface or "NO DEFAULT ROUTE"
+        self.negotiated_link_capacity = self.network_sampler.negotiated_capacity
+        self.effective_link_capacity = self.network_sampler.link_capacity
+        self.source_hostname = self.local_hostname
+        self.active_source_key = self.local_source_key
         return True
 
     def animate(self) -> bool:
@@ -602,10 +823,11 @@ class HeatmapWindow(Gtk.Window):
         context.set_antialias(cairo.ANTIALIAS_BEST)
 
         # Preserve 57% for the CPU heatmap. The right-hand 43% becomes three
-        # full-width landscape rows for memory, disk I/O, and network.
+        # full-width landscape rows below a dedicated source-tab strip.
         metrics_width = width * 0.43
         heatmap_width = max(1.0, width - metrics_width)
-        metric_row_height = height / 3.0
+        tab_strip_height = min(48.0, height * 0.075)
+        metric_row_height = (height - tab_strip_height) / 3.0
 
         cpu_count = len(self.displayed_loads)
         columns, rows = choose_grid(cpu_count, int(heatmap_width), height)
@@ -625,29 +847,43 @@ class HeatmapWindow(Gtk.Window):
 
         context.set_source_rgb(0.16, 0.18, 0.23)
         context.rectangle(heatmap_width, 0.0, 1.0, height)
-        context.rectangle(heatmap_width, metric_row_height, metrics_width, 1.0)
+        context.rectangle(heatmap_width, tab_strip_height, metrics_width, 1.0)
         context.rectangle(
-            heatmap_width, metric_row_height * 2.0, metrics_width, 1.0
+            heatmap_width,
+            tab_strip_height + metric_row_height,
+            metrics_width,
+            1.0,
+        )
+        context.rectangle(
+            heatmap_width,
+            tab_strip_height + metric_row_height * 2.0,
+            metrics_width,
+            1.0,
         )
         context.fill()
 
         self.draw_memory_panel(
-            context, heatmap_width, 0.0, metrics_width, metric_row_height
+            context,
+            heatmap_width,
+            tab_strip_height,
+            metrics_width,
+            metric_row_height,
         )
         self.draw_disk_panel(
             context,
             heatmap_width,
-            metric_row_height,
+            tab_strip_height + metric_row_height,
             metrics_width,
             metric_row_height,
         )
         self.draw_network_panel(
             context,
             heatmap_width,
-            metric_row_height * 2.0,
+            tab_strip_height + metric_row_height * 2.0,
             metrics_width,
             metric_row_height,
         )
+        self.draw_source_tabs(context, heatmap_width, metrics_width, height)
 
         return False
 
@@ -669,6 +905,68 @@ class HeatmapWindow(Gtk.Window):
         context.set_source_rgb(*active_color)
         context.rectangle(x, y, width * usage, height)
         context.fill()
+
+    def draw_source_tabs(
+        self,
+        context: cairo.Context,
+        panel_x: float,
+        panel_width: float,
+        screen_height: float,
+    ) -> None:
+        remote_entries = self.remote_sources[-4:]
+        if (
+            self.active_source_key != self.local_source_key
+            and all(key != self.active_source_key for key, _ in remote_entries)
+        ):
+            active_entry = next(
+                (
+                    entry
+                    for entry in self.remote_sources
+                    if entry[0] == self.active_source_key
+                ),
+                None,
+            )
+            if active_entry is not None:
+                remote_entries = [active_entry] + remote_entries[-3:]
+
+        entries = [
+            (self.local_source_key, f"LOCAL {self.local_hostname}"),
+            *remote_entries,
+        ]
+        tab_height = min(32.0, screen_height * 0.05)
+        tab_y = max(6.0, screen_height * 0.012)
+        font_size = min(15.0, tab_height * 0.46)
+        available_width = max(1.0, panel_width - 24.0)
+        tab_width = min(180.0, available_width / len(entries))
+        start_x = panel_x + panel_width - 12.0 - tab_width * len(entries)
+        self.source_tab_hitboxes = []
+
+        for index, (source_key, raw_label) in enumerate(entries):
+            x = start_x + index * tab_width
+            selected = source_key == self.active_source_key
+            context.set_source_rgb(
+                *((0.065, 0.078, 0.115) if selected else (0.025, 0.028, 0.038))
+            )
+            context.rectangle(x + 1.0, tab_y, max(1.0, tab_width - 2.0), tab_height)
+            context.fill()
+            if selected:
+                context.set_source_rgb(*heat_color(0.44))
+                context.rectangle(
+                    x + 1.0, tab_y + tab_height - 2.0,
+                    max(1.0, tab_width - 2.0), 2.0,
+                )
+                context.fill()
+
+            label = raw_label[:22]
+            draw_centered_text(
+                context, label, x + tab_width / 2.0,
+                tab_y + tab_height * 0.68, font_size,
+                (0.62, 0.66, 0.74) if selected else (0.36, 0.39, 0.46),
+                cairo.FONT_WEIGHT_BOLD if selected else cairo.FONT_WEIGHT_NORMAL,
+            )
+            self.source_tab_hitboxes.append(
+                (x, tab_y, tab_width, tab_height, source_key)
+            )
 
     def draw_memory_panel(
         self,
@@ -704,7 +1002,7 @@ class HeatmapWindow(Gtk.Window):
         draw_centered_text(
             context,
             format_memory_capacity(
-                self.displayed_memory_usage, self.system_sampler.memory_total_bytes
+                self.displayed_memory_usage, self.memory_total_bytes
             ),
             value_x, panel_y + panel_height * 0.44, detail_size,
             (0.42, 0.46, 0.54),
@@ -727,7 +1025,7 @@ class HeatmapWindow(Gtk.Window):
         draw_centered_text(
             context,
             format_memory_capacity(
-                self.displayed_swap_usage, self.system_sampler.swap_total_bytes
+                self.displayed_swap_usage, self.swap_total_bytes
             ),
             value_x, panel_y + panel_height * 0.89, detail_size,
             (0.42, 0.46, 0.54),
@@ -755,7 +1053,7 @@ class HeatmapWindow(Gtk.Window):
             label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
         )
         draw_centered_text(
-            context, self.system_sampler.device_name, label_x,
+            context, self.disk_device_name, label_x,
             panel_y + panel_height * 0.61, device_size, (0.32, 0.37, 0.46),
         )
         self.draw_usage_bar(
@@ -797,10 +1095,10 @@ class HeatmapWindow(Gtk.Window):
         link_rate_size = rate_size * 0.72
         device_size = min(17.0, panel_height * 0.071)
         upload_color = network_heat_color(
-            self.displayed_upload, self.network_sampler.link_capacity
+            self.displayed_upload, self.effective_link_capacity
         )
         download_color = network_heat_color(
-            self.displayed_download, self.network_sampler.link_capacity
+            self.displayed_download, self.effective_link_capacity
         )
 
         for title, rate, color, center_ratio in (
@@ -819,14 +1117,14 @@ class HeatmapWindow(Gtk.Window):
             )
 
         link_center_x = panel_x + panel_width * 0.82
-        interface = self.network_sampler.interface or "NO DEFAULT ROUTE"
+        interface = self.network_interface_name
         draw_centered_text(
             context, "LINK SPEED", link_center_x,
             panel_y + panel_height * 0.36, label_size,
             (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
         )
         draw_centered_text(
-            context, format_link_speed(self.network_sampler.negotiated_capacity),
+            context, format_link_speed(self.negotiated_link_capacity),
             link_center_x, panel_y + panel_height * 0.64, link_rate_size,
             (0.50, 0.50, 0.50), cairo.FONT_WEIGHT_BOLD,
         )
@@ -930,6 +1228,33 @@ def run_self_test() -> None:
     assert heat_color(1.0) == HEAT_STOPS[-1][1]
     assert bar_heat_color(0.14) == heat_color(0.36)
     assert bar_heat_color(1.0) == heat_color(1.0)
+    remote = normalize_remote_snapshot(
+        {
+            "version": 1,
+            "hostname": "remote-host",
+            "cpu": [0.25, 0.75],
+            "memory": {
+                "usage": 0.5,
+                "total_bytes": 8_000_000_000,
+                "swap_usage": 0.1,
+                "swap_total_bytes": 1_000_000_000,
+            },
+            "disk": {
+                "usage": 0.2,
+                "read_bytes_per_second": 1_000_000,
+                "write_bytes_per_second": 2_000_000,
+                "device": "nvme0n1",
+            },
+            "network": {
+                "interface": "eth0",
+                "download_bits_per_second": 10_000_000,
+                "upload_bits_per_second": 1_000_000,
+                "link_bits_per_second": 1_000_000_000,
+            },
+        }
+    )
+    assert remote["hostname"] == "remote-host"
+    assert remote["cpu"] == [0.25, 0.75]
     print("Self-test passed")
 
 
@@ -937,6 +1262,10 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", help="Sway output name; otherwise auto-detect the second display")
     parser.add_argument("--interface", help="network interface; otherwise use the IPv4 default route")
+    parser.add_argument("--listen-address", default="0.0.0.0")
+    parser.add_argument("--listen-port", type=int, default=9177)
+    parser.add_argument("--remote-timeout", type=float, default=2.0)
+    parser.add_argument("--local-only", action="store_true", help="disable the remote TCP listener")
     parser.add_argument("--windowed", action="store_true", help="do not move or fullscreen the window")
     parser.add_argument("--fps", type=float, default=60.0)
     parser.add_argument("--sample-ms", type=float, default=50.0)
@@ -957,12 +1286,20 @@ def main() -> int:
         raise SystemExit("fps and sample-ms must be positive")
     if arguments.heating_seconds <= 0 or arguments.cooling_seconds <= 0:
         raise SystemExit("heating and cooling times must be positive")
+    if not 1 <= arguments.listen_port <= 65535:
+        raise SystemExit("listen-port must be between 1 and 65535")
+    if arguments.remote_timeout <= 0.0:
+        raise SystemExit("remote-timeout must be positive")
     if not 0.05 <= arguments.circle_scale <= 1.0:
         raise SystemExit("circle-scale must be between 0.05 and 1.0")
 
     settings = Settings(
         output=arguments.output,
         network_interface=arguments.interface,
+        listen_address=arguments.listen_address,
+        listen_port=arguments.listen_port,
+        remote_timeout=arguments.remote_timeout,
+        local_only=arguments.local_only,
         windowed=arguments.windowed,
         fps=arguments.fps,
         sample_seconds=arguments.sample_ms / 1000.0,

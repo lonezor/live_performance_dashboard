@@ -1,0 +1,19 @@
+[Unit]
+Description=Live Performance Dashboard remote metrics agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/live-performance-agent
+ExecStart=/usr/bin/python3 /usr/local/bin/live-performance-agent --dashboard ${DASHBOARD_ENDPOINT} --interval-ms ${INTERVAL_MS}
+Restart=always
+RestartSec=2
+DynamicUser=true
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
