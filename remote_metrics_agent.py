@@ -88,6 +88,25 @@ def read_memory() -> Dict[str, float]:
     }
 
 
+def filesystem_usage_from_blocks(
+    total_blocks: int, free_blocks: int, available_blocks: int
+) -> float:
+    """Calculate root usage with the same reserved-block semantics as df."""
+    used_blocks = max(0, total_blocks - free_blocks)
+    usable_blocks = used_blocks + max(0, available_blocks)
+    return 0.0 if usable_blocks <= 0 else clamp01(used_blocks / usable_blocks)
+
+
+def read_root_filesystem_usage(path: str = "/") -> float:
+    try:
+        stats = os.statvfs(path)
+        return filesystem_usage_from_blocks(
+            stats.f_blocks, stats.f_bfree, stats.f_bavail
+        )
+    except OSError:
+        return 0.0
+
+
 def root_block_device() -> Optional[BlockDevice]:
     with open("/proc/self/mountinfo", "r", encoding="utf-8") as source:
         for line in source:
@@ -143,6 +162,7 @@ class DiskSampler:
             "read_bytes_per_second": read_rate,
             "write_bytes_per_second": write_rate,
             "device": self.device[2] if self.device else "NO ROOT DISK",
+            "filesystem_usage": read_root_filesystem_usage(),
         }
 
 
@@ -293,6 +313,7 @@ def run_self_test() -> None:
     assert parse_endpoint("192.0.2.10:9177") == ("192.0.2.10", 9177)
     parsed = parse_cpu_times(("cpu0 10 0 5 35 0 0 0 0 0 0\n",))
     assert parsed == {0: (50, 35)}
+    assert filesystem_usage_from_blocks(1000, 400, 350) == 600 / 950
     assert parse_inet_socket_count(
         (
             "  sl  local_address rem_address   st tx_queue rx_queue\n",

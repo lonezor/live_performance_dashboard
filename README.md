@@ -34,7 +34,8 @@ capacity in proportional bars uses a subtle neutral background.
 - Samples CPU and system counters every 50 ms and renders at 60 FPS.
 - Applies time-based interpolation instead of abrupt visual jumps.
 - Shows RAM and swap as proportional heat bars with used/total decimal GB.
-- Shows root-disk busy time plus synchronized read/write MB/s.
+- Shows root-disk busy time, synchronized read/write MB/s, and proportional
+  root-filesystem capacity usage.
 - Selects the active IPv4 default-route interface automatically.
 - Shows network uplink, downlink, interface name, negotiated link speed, TCP
   connections, and UDP sockets.
@@ -52,6 +53,7 @@ capacity in proportional bars uses a subtle neutral background.
 | RAM and swap | `/proc/meminfo` |
 | Root device | `/proc/self/mountinfo` |
 | Disk busy/read/write | `/proc/diskstats` |
+| Root-filesystem capacity | `statvfs(2)` for `/` |
 | Default network interface | `/proc/net/route` |
 | Network throughput | `/proc/net/dev` |
 | TCP connections and UDP sockets | `/proc/net/tcp*`, `/proc/net/udp*` |

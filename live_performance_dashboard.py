@@ -312,6 +312,25 @@ def read_memory_usage(path: str = "/proc/meminfo") -> float:
     return read_memory_stats(path)[0]
 
 
+def filesystem_usage_from_blocks(
+    total_blocks: int, free_blocks: int, available_blocks: int
+) -> float:
+    """Calculate root usage with the same reserved-block semantics as df."""
+    used_blocks = max(0, total_blocks - free_blocks)
+    usable_blocks = used_blocks + max(0, available_blocks)
+    return 0.0 if usable_blocks <= 0 else clamp01(used_blocks / usable_blocks)
+
+
+def read_root_filesystem_usage(path: str = "/") -> float:
+    try:
+        stats = os.statvfs(path)
+        return filesystem_usage_from_blocks(
+            stats.f_blocks, stats.f_bfree, stats.f_bavail
+        )
+    except OSError:
+        return 0.0
+
+
 def parse_root_block_device(lines: Iterable[str]) -> Optional[BlockDevice]:
     """Return (major, minor, device name) for the root filesystem."""
     for line in lines:
@@ -373,6 +392,7 @@ class SystemUsageSampler:
             self.swap_usage,
             self.swap_total_bytes,
         ) = read_memory_stats()
+        self.filesystem_usage = read_root_filesystem_usage()
         self.previous_disk = read_disk_counters(self.device)
         self.previous_time = time.monotonic()
 
@@ -380,13 +400,14 @@ class SystemUsageSampler:
     def device_name(self) -> str:
         return self.device[2] if self.device else "NO ROOT DISK"
 
-    def sample(self) -> Tuple[float, float, float, float, float]:
+    def sample(self) -> Tuple[float, float, float, float, float, float]:
         (
             self.memory_usage,
             self.memory_total_bytes,
             self.swap_usage,
             self.swap_total_bytes,
         ) = read_memory_stats()
+        self.filesystem_usage = read_root_filesystem_usage()
         now = time.monotonic()
         disk = read_disk_counters(self.device)
         elapsed = now - self.previous_time
@@ -408,6 +429,7 @@ class SystemUsageSampler:
             disk_usage,
             read_bytes_per_second,
             write_bytes_per_second,
+            self.filesystem_usage,
         )
 
 
@@ -423,7 +445,7 @@ def format_disk_rate(bytes_per_second: float) -> str:
 def format_memory_capacity(usage: float, total_bytes: float) -> str:
     total_gb = max(0.0, total_bytes) / 1_000_000_000.0
     used_gb = clamp01(usage) * total_gb
-    return f"{used_gb:.1f} / {total_gb:.1f} GB"
+    return f"{used_gb:.2f} / {total_gb:.2f} GB"
 
 
 def format_bit_rate(bits_per_second: float) -> str:
@@ -512,6 +534,7 @@ def normalize_remote_snapshot(payload: object) -> Dict[str, object]:
     link_speed = None if link_value is None else finite_number(link_value)
     tcp_value = network.get("tcp_connections")
     udp_value = network.get("udp_sockets")
+    filesystem_value = disk.get("filesystem_usage")
     tcp_connections = (
         None if tcp_value is None else int(finite_number(tcp_value))
     )
@@ -527,6 +550,11 @@ def normalize_remote_snapshot(payload: object) -> Dict[str, object]:
         "disk_read": finite_number(disk.get("read_bytes_per_second", 0.0)),
         "disk_write": finite_number(disk.get("write_bytes_per_second", 0.0)),
         "disk_device": device,
+        "filesystem_usage": (
+            None
+            if filesystem_value is None
+            else clamp01(finite_number(filesystem_value))
+        ),
         "download": finite_number(network.get("download_bits_per_second", 0.0)),
         "upload": finite_number(network.get("upload_bits_per_second", 0.0)),
         "network_interface": interface,
@@ -696,11 +724,14 @@ class HeatmapWindow(Gtk.Window):
         self.target_disk_usage = 0.0
         self.target_disk_read = 0.0
         self.target_disk_write = 0.0
+        self.target_filesystem_usage = self.system_sampler.filesystem_usage
         self.displayed_memory_usage = self.target_memory_usage
         self.displayed_swap_usage = self.target_swap_usage
         self.displayed_disk_usage = 0.0
         self.displayed_disk_read = 0.0
         self.displayed_disk_write = 0.0
+        self.displayed_filesystem_usage = self.target_filesystem_usage
+        self.filesystem_usage_available = True
         self.memory_total_bytes = self.system_sampler.memory_total_bytes
         self.swap_total_bytes = self.system_sampler.swap_total_bytes
         self.disk_device_name = self.system_sampler.device_name
@@ -780,6 +811,11 @@ class HeatmapWindow(Gtk.Window):
         self.target_disk_usage = float(snapshot["disk_usage"])
         self.target_disk_read = float(snapshot["disk_read"])
         self.target_disk_write = float(snapshot["disk_write"])
+        filesystem_usage = snapshot["filesystem_usage"]
+        self.filesystem_usage_available = filesystem_usage is not None
+        self.target_filesystem_usage = (
+            0.0 if filesystem_usage is None else float(filesystem_usage)
+        )
         self.disk_device_name = str(snapshot["disk_device"])
         self.target_download = float(snapshot["download"])
         self.target_upload = float(snapshot["upload"])
@@ -834,7 +870,9 @@ class HeatmapWindow(Gtk.Window):
             self.target_disk_usage,
             self.target_disk_read,
             self.target_disk_write,
+            self.target_filesystem_usage,
         ) = self.system_sampler.sample()
+        self.filesystem_usage_available = True
         self.memory_total_bytes = self.system_sampler.memory_total_bytes
         self.swap_total_bytes = self.system_sampler.swap_total_bytes
         self.disk_device_name = self.system_sampler.device_name
@@ -884,6 +922,9 @@ class HeatmapWindow(Gtk.Window):
         ) * system_blend
         self.displayed_disk_write += (
             self.target_disk_write - self.displayed_disk_write
+        ) * system_blend
+        self.displayed_filesystem_usage += (
+            self.target_filesystem_usage - self.displayed_filesystem_usage
         ) * system_blend
 
         self.canvas.queue_draw()
@@ -1121,9 +1162,11 @@ class HeatmapWindow(Gtk.Window):
         label_x = panel_x + panel_width * 0.10
         bar_x = panel_x + panel_width * 0.20
         bar_width = panel_width * 0.34
-        bar_y = panel_y + panel_height * 0.29
-        bar_height = panel_height * 0.22
+        bar_y = panel_y + panel_height * 0.19
+        bar_height = panel_height * 0.20
         bar_center_y = bar_y + bar_height / 2.0
+        filesystem_bar_y = panel_y + panel_height * 0.64
+        filesystem_bar_center_y = filesystem_bar_y + bar_height / 2.0
 
         draw_visually_centered_text(
             context, "DISK I/O", label_x, bar_center_y,
@@ -1137,6 +1180,27 @@ class HeatmapWindow(Gtk.Window):
         draw_visually_centered_text(
             context, f"{self.displayed_disk_usage * 100.0:.0f}%",
             panel_x + panel_width * 0.59, bar_center_y,
+            value_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+        )
+
+        draw_visually_centered_text(
+            context, "FILESYSTEM", label_x, filesystem_bar_center_y,
+            label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+        )
+        self.draw_usage_bar(
+            context, bar_x, filesystem_bar_y, bar_width,
+            bar_height, self.displayed_filesystem_usage,
+            bar_heat_color(self.displayed_filesystem_usage),
+            (0.065, 0.070, 0.082),
+        )
+        filesystem_text = (
+            f"{self.displayed_filesystem_usage * 100.0:.0f}%"
+            if self.filesystem_usage_available
+            else "—"
+        )
+        draw_visually_centered_text(
+            context, filesystem_text,
+            panel_x + panel_width * 0.59, filesystem_bar_center_y,
             value_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
         )
 
@@ -1320,6 +1384,7 @@ def run_self_test() -> None:
             "SwapFree: 400 kB\n",
         )
     ) == (0.65, 1_000_000.0, 0.2, 500_000.0)
+    assert filesystem_usage_from_blocks(1000, 400, 350) == 600 / 950
     assert parse_root_block_device(
         ("1 0 259:2 / / rw - ext4 /dev/nvme0n1p2 rw\n",)
     ) == (259, 2, "nvme0n1p2")
@@ -1328,7 +1393,7 @@ def run_self_test() -> None:
     ) == (100, 200, 42)
     assert format_disk_rate(850_000.0) == "0.85 MB/s"
     assert format_disk_rate(124_000_000.0) == "124 MB/s"
-    assert format_memory_capacity(0.25, 16_000_000_000.0) == "4.0 / 16.0 GB"
+    assert format_memory_capacity(0.25, 16_000_000_000.0) == "4.00 / 16.00 GB"
     assert format_bit_rate(850_000.0) == "850 kbps"
     assert format_bit_rate(12_500_000.0) == "12.5 Mbps"
     assert format_link_speed(1_000_000_000.0) == "1 Gbps"
@@ -1357,6 +1422,7 @@ def run_self_test() -> None:
                 "read_bytes_per_second": 1_000_000,
                 "write_bytes_per_second": 2_000_000,
                 "device": "nvme0n1",
+                "filesystem_usage": 0.62,
             },
             "network": {
                 "interface": "eth0",
@@ -1372,6 +1438,7 @@ def run_self_test() -> None:
     assert remote["cpu"] == [0.25, 0.75]
     assert remote["tcp_connections"] == 12
     assert remote["udp_sockets"] == 4
+    assert remote["filesystem_usage"] == 0.62
     legacy_payload = {
         "version": 1,
         "hostname": "legacy-host",
@@ -1383,6 +1450,7 @@ def run_self_test() -> None:
     legacy = normalize_remote_snapshot(legacy_payload)
     assert legacy["tcp_connections"] is None
     assert legacy["udp_sockets"] is None
+    assert legacy["filesystem_usage"] is None
     print("Self-test passed")
 
 
