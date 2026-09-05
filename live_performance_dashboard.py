@@ -397,12 +397,12 @@ def format_bit_rate(bits_per_second: float) -> str:
 
 def format_link_speed(bits_per_second: Optional[float]) -> str:
     if bits_per_second is None or bits_per_second <= 0.0:
-        return "LINK SPEED: UNKNOWN"
+        return "UNKNOWN"
     if bits_per_second >= 1_000_000_000.0:
         gbps = bits_per_second / 1_000_000_000.0
         value = f"{gbps:.0f}" if gbps.is_integer() else f"{gbps:.1f}"
-        return f"LINK SPEED: {value} Gbps"
-    return f"LINK SPEED: {bits_per_second / 1_000_000.0:.0f} Mbps"
+        return f"{value} Gbps"
+    return f"{bits_per_second / 1_000_000.0:.0f} Mbps"
 
 
 def draw_centered_text(
@@ -794,7 +794,7 @@ class HeatmapWindow(Gtk.Window):
     ) -> None:
         label_size = min(24.0, panel_height * 0.10)
         rate_size = min(44.0, panel_height * 0.18)
-        detail_size = min(18.0, panel_height * 0.075)
+        link_rate_size = rate_size * 0.72
         device_size = min(17.0, panel_height * 0.071)
         upload_color = network_heat_color(
             self.displayed_upload, self.network_sampler.link_capacity
@@ -821,13 +821,17 @@ class HeatmapWindow(Gtk.Window):
         link_center_x = panel_x + panel_width * 0.82
         interface = self.network_sampler.interface or "NO DEFAULT ROUTE"
         draw_centered_text(
-            context,
-            format_link_speed(self.network_sampler.negotiated_capacity),
-            link_center_x, panel_y + panel_height * 0.44, detail_size,
-            (0.42, 0.46, 0.54), cairo.FONT_WEIGHT_BOLD,
+            context, "LINK SPEED", link_center_x,
+            panel_y + panel_height * 0.36, label_size,
+            (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
         )
         draw_centered_text(
-            context, interface, link_center_x, panel_y + panel_height * 0.67,
+            context, format_link_speed(self.network_sampler.negotiated_capacity),
+            link_center_x, panel_y + panel_height * 0.64, link_rate_size,
+            (0.50, 0.50, 0.50), cairo.FONT_WEIGHT_BOLD,
+        )
+        draw_centered_text(
+            context, interface, link_center_x, panel_y + panel_height * 0.86,
             device_size,
             (0.32, 0.37, 0.46),
         )
@@ -916,10 +920,10 @@ def run_self_test() -> None:
     assert format_memory_capacity(0.25, 16_000_000_000.0) == "4.0 / 16.0 GB"
     assert format_bit_rate(850_000.0) == "850 kbps"
     assert format_bit_rate(12_500_000.0) == "12.5 Mbps"
-    assert format_link_speed(1_000_000_000.0) == "LINK SPEED: 1 Gbps"
-    assert format_link_speed(2_500_000_000.0) == "LINK SPEED: 2.5 Gbps"
-    assert format_link_speed(100_000_000.0) == "LINK SPEED: 100 Mbps"
-    assert format_link_speed(None) == "LINK SPEED: UNKNOWN"
+    assert format_link_speed(1_000_000_000.0) == "1 Gbps"
+    assert format_link_speed(2_500_000_000.0) == "2.5 Gbps"
+    assert format_link_speed(100_000_000.0) == "100 Mbps"
+    assert format_link_speed(None) == "UNKNOWN"
     assert network_heat_color(1_000_000_000.0, 1_000_000_000.0) == heat_color(1.0)
     assert network_heat_color(0.0, 1_000_000_000.0) == (0.20, 0.22, 0.28)
     assert heat_color(0.0) == (0.0, 0.0, 0.0)

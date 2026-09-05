@@ -126,7 +126,7 @@ Network counters include all traffic on the selected interface, including
 local-network traffic; they are not guaranteed to represent Internet-only
 traffic. Network heat color is normalized against the reported link speed.
 When link speed is unavailable, color normalization uses a 1 Gbps fallback,
-while the visible label correctly reports `LINK SPEED: UNKNOWN`.
+while the LINK SPEED value correctly reports `UNKNOWN`.
 
 Disk busy percentage and MB/s are complementary. Busy time indicates how long
 the root device has outstanding work, while throughput shows the data volume.
