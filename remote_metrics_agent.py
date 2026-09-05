@@ -190,6 +190,43 @@ def read_link_speed(interface: Optional[str]) -> Optional[float]:
         return None
 
 
+def parse_inet_socket_count(lines: Iterable[str], established_only: bool) -> int:
+    """Count valid /proc/net socket rows, optionally only TCP ESTABLISHED."""
+    count = 0
+    for line in lines:
+        fields = line.split()
+        if not fields or fields[0] == "sl" or not fields[0].rstrip(":").isdigit():
+            continue
+        if established_only and (len(fields) < 4 or fields[3] != "01"):
+            continue
+        count += 1
+    return count
+
+
+def read_socket_counts(proc_net_root: str = "/proc/net") -> Tuple[int, int]:
+    """Return all current TCP and UDP sockets (IPv4 + IPv6)."""
+    tcp_connections = 0
+    udp_sockets = 0
+    for filename, established_only in (
+        ("tcp", False),
+        ("tcp6", False),
+        ("udp", False),
+        ("udp6", False),
+    ):
+        try:
+            with open(
+                os.path.join(proc_net_root, filename), "r", encoding="ascii"
+            ) as source:
+                count = parse_inet_socket_count(source, established_only)
+        except OSError:
+            count = 0
+        if filename.startswith("tcp"):
+            tcp_connections += count
+        else:
+            udp_sockets += count
+    return tcp_connections, udp_sockets
+
+
 class NetworkSampler:
     def __init__(self, requested_interface: Optional[str]) -> None:
         self.interface = requested_interface or default_route_interface()
@@ -209,11 +246,14 @@ class NetworkSampler:
             upload = max(0, current[1] - self.previous[1]) * 8.0 / elapsed
         self.previous = current
         self.previous_time = now
+        tcp_connections, udp_sockets = read_socket_counts()
         return {
             "interface": self.interface or "NO DEFAULT ROUTE",
             "download_bits_per_second": download,
             "upload_bits_per_second": upload,
             "link_bits_per_second": read_link_speed(self.interface),
+            "tcp_connections": tcp_connections,
+            "udp_sockets": udp_sockets,
         }
 
 
@@ -253,6 +293,22 @@ def run_self_test() -> None:
     assert parse_endpoint("192.0.2.10:9177") == ("192.0.2.10", 9177)
     parsed = parse_cpu_times(("cpu0 10 0 5 35 0 0 0 0 0 0\n",))
     assert parsed == {0: (50, 35)}
+    assert parse_inet_socket_count(
+        (
+            "  sl  local_address rem_address   st tx_queue rx_queue\n",
+            "   0: 0100007F:23D1 0100007F:C001 01 00000000:00000000\n",
+            "   1: 00000000:0016 00000000:0000 0A 00000000:00000000\n",
+        ),
+        established_only=True,
+    ) == 1
+    assert parse_inet_socket_count(
+        (
+            "  sl  local_address rem_address   st tx_queue rx_queue\n",
+            "   0: 0100007F:23D1 0100007F:C001 01 00000000:00000000\n",
+            "   1: 00000000:0016 00000000:0000 0A 00000000:00000000\n",
+        ),
+        established_only=False,
+    ) == 2
     print("Remote agent self-test passed")
 
 

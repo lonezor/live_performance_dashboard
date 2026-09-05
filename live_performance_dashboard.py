@@ -199,6 +199,43 @@ def read_link_capacity(
     return None
 
 
+def parse_inet_socket_count(lines: Iterable[str], established_only: bool) -> int:
+    """Count valid /proc/net socket rows, optionally only TCP ESTABLISHED."""
+    count = 0
+    for line in lines:
+        fields = line.split()
+        if not fields or fields[0] == "sl" or not fields[0].rstrip(":").isdigit():
+            continue
+        if established_only and (len(fields) < 4 or fields[3] != "01"):
+            continue
+        count += 1
+    return count
+
+
+def read_socket_counts(proc_net_root: str = "/proc/net") -> Tuple[int, int]:
+    """Return all current TCP and UDP sockets (IPv4 + IPv6)."""
+    tcp_connections = 0
+    udp_sockets = 0
+    for filename, established_only in (
+        ("tcp", False),
+        ("tcp6", False),
+        ("udp", False),
+        ("udp6", False),
+    ):
+        try:
+            with open(
+                os.path.join(proc_net_root, filename), "r", encoding="ascii"
+            ) as socket_file:
+                count = parse_inet_socket_count(socket_file, established_only)
+        except OSError:
+            count = 0
+        if filename.startswith("tcp"):
+            tcp_connections += count
+        else:
+            udp_sockets += count
+    return tcp_connections, udp_sockets
+
+
 class NetworkRateSampler:
     def __init__(self, requested_interface: Optional[str]) -> None:
         self.interface = requested_interface or default_route_interface()
@@ -473,6 +510,12 @@ def normalize_remote_snapshot(payload: object) -> Dict[str, object]:
     interface = str(network.get("interface", "REMOTE INTERFACE"))[:64]
     link_value = network.get("link_bits_per_second")
     link_speed = None if link_value is None else finite_number(link_value)
+    tcp_value = network.get("tcp_connections")
+    udp_value = network.get("udp_sockets")
+    tcp_connections = (
+        None if tcp_value is None else int(finite_number(tcp_value))
+    )
+    udp_sockets = None if udp_value is None else int(finite_number(udp_value))
     return {
         "hostname": hostname,
         "cpu": [clamp01(finite_number(value)) for value in cpu],
@@ -488,6 +531,8 @@ def normalize_remote_snapshot(payload: object) -> Dict[str, object]:
         "upload": finite_number(network.get("upload_bits_per_second", 0.0)),
         "network_interface": interface,
         "link_capacity": link_speed,
+        "tcp_connections": tcp_connections,
+        "udp_sockets": udp_sockets,
     }
 
 
@@ -662,6 +707,7 @@ class HeatmapWindow(Gtk.Window):
         self.network_interface_name = self.network_sampler.interface or "NO DEFAULT ROUTE"
         self.negotiated_link_capacity = self.network_sampler.negotiated_capacity
         self.effective_link_capacity = self.network_sampler.link_capacity
+        self.tcp_connections, self.udp_sockets = read_socket_counts()
         self.local_hostname = socket.gethostname()
         self.source_hostname = self.local_hostname
         self.local_source_key = f"local:{self.local_hostname}"
@@ -743,6 +789,12 @@ class HeatmapWindow(Gtk.Window):
             None if link_capacity is None else float(link_capacity)
         )
         self.effective_link_capacity = self.negotiated_link_capacity or 1_000_000_000.0
+        tcp_connections = snapshot["tcp_connections"]
+        udp_sockets = snapshot["udp_sockets"]
+        self.tcp_connections = (
+            None if tcp_connections is None else int(tcp_connections)
+        )
+        self.udp_sockets = None if udp_sockets is None else int(udp_sockets)
         self.source_hostname = str(snapshot["hostname"])
         self.active_source_key = source_key
 
@@ -789,6 +841,7 @@ class HeatmapWindow(Gtk.Window):
         self.network_interface_name = self.network_sampler.interface or "NO DEFAULT ROUTE"
         self.negotiated_link_capacity = self.network_sampler.negotiated_capacity
         self.effective_link_capacity = self.network_sampler.link_capacity
+        self.tcp_connections, self.udp_sockets = read_socket_counts()
         self.source_hostname = self.local_hostname
         self.active_source_key = self.local_source_key
         return True
@@ -1144,6 +1197,23 @@ class HeatmapWindow(Gtk.Window):
                 cairo.FONT_WEIGHT_BOLD,
             )
 
+        # The three footer values intentionally share one size, color, and
+        # baseline so they read as a single aligned network-status row.
+        footer_y = panel_y + panel_height * 0.86
+        footer_color = (0.32, 0.37, 0.46)
+        tcp_text = "TCP —" if self.tcp_connections is None else f"TCP {self.tcp_connections}"
+        udp_text = "UDP —" if self.udp_sockets is None else f"UDP {self.udp_sockets}"
+        draw_centered_text(
+            context, tcp_text,
+            panel_x + panel_width * 0.18, footer_y,
+            device_size, footer_color,
+        )
+        draw_centered_text(
+            context, udp_text,
+            panel_x + panel_width * 0.50, footer_y,
+            device_size, footer_color,
+        )
+
         link_center_x = panel_x + panel_width * 0.82
         interface = self.network_interface_name
         draw_centered_text(
@@ -1157,9 +1227,8 @@ class HeatmapWindow(Gtk.Window):
             (0.50, 0.50, 0.50), cairo.FONT_WEIGHT_BOLD,
         )
         draw_centered_text(
-            context, interface, link_center_x, panel_y + panel_height * 0.86,
-            device_size,
-            (0.32, 0.37, 0.46),
+            context, interface, link_center_x, footer_y,
+            device_size, footer_color,
         )
 
     def place_on_output(self) -> bool:
@@ -1224,6 +1293,22 @@ def run_self_test() -> None:
     assert parse_network_bytes(
         ("  eth0: 1200 1 0 0 0 0 0 0 3400 2 0 0 0 0 0 0\n",), "eth0"
     ) == (1200, 3400)
+    assert parse_inet_socket_count(
+        (
+            "  sl  local_address rem_address   st tx_queue rx_queue\n",
+            "   0: 0100007F:23D1 0100007F:C001 01 00000000:00000000\n",
+            "   1: 00000000:0016 00000000:0000 0A 00000000:00000000\n",
+        ),
+        established_only=True,
+    ) == 1
+    assert parse_inet_socket_count(
+        (
+            "  sl  local_address rem_address   st tx_queue rx_queue\n",
+            "   0: 0100007F:23D1 0100007F:C001 01 00000000:00000000\n",
+            "   1: 00000000:0016 00000000:0000 0A 00000000:00000000\n",
+        ),
+        established_only=False,
+    ) == 2
     assert parse_memory_usage(
         ("MemTotal: 1000 kB\n", "MemAvailable: 350 kB\n")
     ) == 0.65
@@ -1278,11 +1363,26 @@ def run_self_test() -> None:
                 "download_bits_per_second": 10_000_000,
                 "upload_bits_per_second": 1_000_000,
                 "link_bits_per_second": 1_000_000_000,
+                "tcp_connections": 12,
+                "udp_sockets": 4,
             },
         }
     )
     assert remote["hostname"] == "remote-host"
     assert remote["cpu"] == [0.25, 0.75]
+    assert remote["tcp_connections"] == 12
+    assert remote["udp_sockets"] == 4
+    legacy_payload = {
+        "version": 1,
+        "hostname": "legacy-host",
+        "cpu": [0.5],
+        "memory": {},
+        "disk": {},
+        "network": {},
+    }
+    legacy = normalize_remote_snapshot(legacy_payload)
+    assert legacy["tcp_connections"] is None
+    assert legacy["udp_sockets"] is None
     print("Self-test passed")
 
 

@@ -36,7 +36,8 @@ capacity in proportional bars uses a subtle neutral background.
 - Shows RAM and swap as proportional heat bars with used/total decimal GB.
 - Shows root-disk busy time plus synchronized read/write MB/s.
 - Selects the active IPv4 default-route interface automatically.
-- Shows network uplink, downlink, interface name, and negotiated link speed.
+- Shows network uplink, downlink, interface name, negotiated link speed, TCP
+  connections, and UDP sockets.
 - Prefers an active 1920×720 secondary Sway output but supports other sizes.
 - Can run fullscreen under Sway or as a normal test window.
 - Supports direct invocation by a desktop user or by root.
@@ -53,6 +54,7 @@ capacity in proportional bars uses a subtle neutral background.
 | Disk busy/read/write | `/proc/diskstats` |
 | Default network interface | `/proc/net/route` |
 | Network throughput | `/proc/net/dev` |
+| TCP connections and UDP sockets | `/proc/net/tcp*`, `/proc/net/udp*` |
 | Negotiated Ethernet speed | `/sys/class/net/<interface>/speed` |
 
 CPU utilization comes from `/proc/stat`, not `/proc/cpuinfo`.
@@ -127,6 +129,10 @@ retries placement. `--windowed` disables automatic moving and fullscreen mode.
 Network counters include all traffic on the selected interface, including
 local-network traffic; they are not guaranteed to represent Internet-only
 traffic. Network heat color is normalized against the reported link speed.
+The TCP footer counts all current IPv4 and IPv6 TCP sockets, including listening,
+established, closing, and waiting states. The UDP footer counts open IPv4 and
+IPv6 sockets; UDP is connectionless, so this is an endpoint count rather than a
+literal connection count.
 When link speed is unavailable, color normalization uses a 1 Gbps fallback,
 while the LINK SPEED value correctly reports `UNKNOWN`.
 
