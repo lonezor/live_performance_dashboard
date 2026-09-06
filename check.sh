@@ -13,3 +13,5 @@ PYTHONPYCACHEPREFIX="$cache_dir" /usr/bin/python3 -m py_compile \
 env -u DISPLAY -u XAUTHORITY \
     /usr/bin/python3 "$script_dir/live_performance_dashboard.py" --self-test
 /usr/bin/python3 "$script_dir/remote_metrics_agent.py" --self-test
+
+env -u DISPLAY -u XAUTHORITY /usr/bin/python3 "$script_dir/test_layout.py"

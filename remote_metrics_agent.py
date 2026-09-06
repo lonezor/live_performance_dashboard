@@ -158,6 +158,7 @@ class DiskSampler:
         self.previous = current
         self.previous_time = now
         return {
+            "available": current is not None,
             "usage": usage,
             "read_bytes_per_second": read_rate,
             "write_bytes_per_second": write_rate,

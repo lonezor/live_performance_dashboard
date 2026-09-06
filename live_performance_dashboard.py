@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
 import json
 import math
@@ -31,6 +32,7 @@ NetworkBytes = Tuple[int, int]
 BlockDevice = Tuple[int, int, str]
 DiskCounters = Tuple[int, int, int]
 MemoryStats = Tuple[float, float, float, float]
+Rectangle = Tuple[float, float, float, float]
 
 HEAT_STOPS: Sequence[Tuple[float, Color]] = (
     (0.00, (0.000, 0.000, 0.000)),
@@ -66,6 +68,7 @@ def bar_heat_color(usage: float) -> Color:
     return heat_color(max(0.36, clamp01(usage)))
 
 
+@functools.lru_cache(maxsize=128)
 def choose_grid(cpu_count: int, width: int, height: int) -> Tuple[int, int]:
     """Choose a compact grid whose cells make the largest possible circles."""
     if cpu_count <= 0:
@@ -76,10 +79,27 @@ def choose_grid(cpu_count: int, width: int, height: int) -> Tuple[int, int]:
         rows = math.ceil(cpu_count / columns)
         unused = columns * rows - cpu_count
         cell_diameter = min(width / columns, height / rows)
-        candidates.append((unused, -cell_diameter, columns, rows))
+        candidates.append((-cell_diameter, unused, columns, rows))
 
     _, _, columns, rows = min(candidates)
     return columns, rows
+
+
+def dashboard_regions(width: float, height: float) -> Tuple[float, Rectangle, Rectangle]:
+    """Return tab height, CPU rectangle and metrics rectangle in GTK units."""
+    width, height = max(1.0, width), max(1.0, height)
+    tabs = min(44.0, max(28.0, height * 0.06), height * 0.15)
+    content_height = height - tabs
+    if width >= 900 and width / height >= 1.5:
+        metrics_width = min(width * 0.52, max(420.0, width * 0.43))
+        cpu_width = width - metrics_width
+        return tabs, (0.0, tabs, cpu_width, content_height), (
+            cpu_width, tabs, metrics_width, content_height
+        )
+    cpu_height = content_height * 0.40
+    return tabs, (0.0, tabs, width, cpu_height), (
+        0.0, tabs + cpu_height, width, content_height - cpu_height
+    )
 
 
 def parse_proc_stat(lines: Iterable[str]) -> Dict[int, CpuTimes]:
@@ -434,6 +454,8 @@ class SystemUsageSampler:
 
 
 def format_disk_rate(bytes_per_second: float) -> str:
+    if bytes_per_second >= 1_000_000_000.0:
+        return f"{bytes_per_second / 1_000_000_000.0:.1f} GB/s"
     megabytes_per_second = max(0.0, bytes_per_second) / 1_000_000.0
     if megabytes_per_second < 10.0:
         return f"{megabytes_per_second:.2f} MB/s"
@@ -444,12 +466,18 @@ def format_disk_rate(bytes_per_second: float) -> str:
 
 def format_memory_capacity(usage: float, total_bytes: float) -> str:
     total_gb = max(0.0, total_bytes) / 1_000_000_000.0
+    unit = "GB"
+    if total_gb >= 1000.0:
+        total_gb /= 1000.0
+        unit = "TB"
     used_gb = clamp01(usage) * total_gb
-    return f"{used_gb:.2f} / {total_gb:.2f} GB"
+    return f"{used_gb:.2f} / {total_gb:.2f} {unit}"
 
 
 def format_bit_rate(bits_per_second: float) -> str:
     rate = max(0.0, bits_per_second)
+    if rate >= 1_000_000_000.0:
+        return f"{rate / 1_000_000_000.0:.1f} Gbps"
     if rate < 1_000_000.0:
         kbps = rate / 1_000.0
         return f"{kbps:.1f} kbps" if kbps < 100.0 else f"{kbps:.0f} kbps"
@@ -475,9 +503,22 @@ def draw_centered_text(
     size: float,
     color: Color,
     weight: int = cairo.FONT_WEIGHT_NORMAL,
+    max_width: Optional[float] = None,
+    ellipsize: bool = False,
 ) -> None:
     context.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, weight)
     context.set_font_size(size)
+    if max_width is not None:
+        max_width = max(1.0, max_width)
+        if ellipsize:
+            original = text
+            while text and context.text_extents(text)[2] > max_width:
+                original = original[:-1]
+                text = original + "…" if original else ""
+        else:
+            ink_width = context.text_extents(text)[2]
+            if ink_width > max_width:
+                context.set_font_size(size * max_width / ink_width)
     x_bearing, _, text_width, _, _, _ = context.text_extents(text)
     context.set_source_rgb(*color)
     context.move_to(center_x - text_width / 2.0 - x_bearing, baseline_y)
@@ -492,10 +533,23 @@ def draw_visually_centered_text(
     size: float,
     color: Color,
     weight: int = cairo.FONT_WEIGHT_NORMAL,
+    max_width: Optional[float] = None,
+    ellipsize: bool = False,
 ) -> None:
     """Center text using its rendered ink bounds on both axes."""
     context.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, weight)
     context.set_font_size(size)
+    if max_width is not None:
+        max_width = max(1.0, max_width)
+        if ellipsize:
+            original = text
+            while text and context.text_extents(text)[2] > max_width:
+                original = original[:-1]
+                text = original + "…" if original else ""
+        else:
+            ink_width = context.text_extents(text)[2]
+            if ink_width > max_width:
+                context.set_font_size(size * max_width / ink_width)
     x_bearing, y_bearing, text_width, text_height, _, _ = context.text_extents(text)
     context.set_source_rgb(*color)
     context.move_to(
@@ -534,6 +588,9 @@ def normalize_remote_snapshot(payload: object) -> Dict[str, object]:
     link_speed = None if link_value is None else finite_number(link_value)
     tcp_value = network.get("tcp_connections")
     udp_value = network.get("udp_sockets")
+    disk_available = disk.get("available", True)
+    if disk_available is not None and not isinstance(disk_available, bool):
+        raise ValueError("invalid disk availability")
     filesystem_value = disk.get("filesystem_usage")
     tcp_connections = (
         None if tcp_value is None else int(finite_number(tcp_value))
@@ -550,6 +607,7 @@ def normalize_remote_snapshot(payload: object) -> Dict[str, object]:
         "disk_read": finite_number(disk.get("read_bytes_per_second", 0.0)),
         "disk_write": finite_number(disk.get("write_bytes_per_second", 0.0)),
         "disk_device": device,
+        "disk_available": disk_available,
         "filesystem_usage": (
             None
             if filesystem_value is None
@@ -690,7 +748,7 @@ class HeatmapWindow(Gtk.Window):
         super().__init__(title="Live Performance Dashboard")
         self.settings = settings
         self.set_wmclass("live-performance-dashboard", "LivePerformanceDashboard")
-        self.set_decorated(False)
+        self.set_decorated(settings.windowed or not discover_sway_socket())
         self.set_default_size(960, 360)
         self.connect("destroy", self.on_destroy)
         self.connect("key-press-event", self.on_key_press)
@@ -735,6 +793,7 @@ class HeatmapWindow(Gtk.Window):
         self.memory_total_bytes = self.system_sampler.memory_total_bytes
         self.swap_total_bytes = self.system_sampler.swap_total_bytes
         self.disk_device_name = self.system_sampler.device_name
+        self.disk_usage_available = self.system_sampler.previous_disk is not None
         self.network_interface_name = self.network_sampler.interface or "NO DEFAULT ROUTE"
         self.negotiated_link_capacity = self.network_sampler.negotiated_capacity
         self.effective_link_capacity = self.network_sampler.link_capacity
@@ -817,6 +876,7 @@ class HeatmapWindow(Gtk.Window):
             0.0 if filesystem_usage is None else float(filesystem_usage)
         )
         self.disk_device_name = str(snapshot["disk_device"])
+        self.disk_usage_available = snapshot["disk_available"]
         self.target_download = float(snapshot["download"])
         self.target_upload = float(snapshot["upload"])
         self.network_interface_name = str(snapshot["network_interface"])
@@ -838,10 +898,13 @@ class HeatmapWindow(Gtk.Window):
         active_remotes: List[Tuple[str, Dict[str, object], float]] = []
         if self.remote_server is not None:
             active_remotes = self.remote_server.active(self.settings.remote_timeout)
-        self.remote_sources = [
-            (key, str(snapshot["hostname"]))
-            for key, snapshot, _ in active_remotes
-        ]
+        # Packet timestamps select the freshest source, but must never move
+        # tabs or change the keyboard navigation order on every sample.
+        self.remote_sources = sorted(
+            ((key, str(snapshot["hostname"]))
+             for key, snapshot, _ in active_remotes),
+            key=lambda entry: (entry[1].casefold(), entry[0]),
+        )
         remote_by_key = {
             key: snapshot for key, snapshot, _ in active_remotes
         }
@@ -876,6 +939,7 @@ class HeatmapWindow(Gtk.Window):
         self.memory_total_bytes = self.system_sampler.memory_total_bytes
         self.swap_total_bytes = self.system_sampler.swap_total_bytes
         self.disk_device_name = self.system_sampler.device_name
+        self.disk_usage_available = self.system_sampler.previous_disk is not None
         self.network_interface_name = self.network_sampler.interface or "NO DEFAULT ROUTE"
         self.negotiated_link_capacity = self.network_sampler.negotiated_capacity
         self.effective_link_capacity = self.network_sampler.link_capacity
@@ -936,71 +1000,60 @@ class HeatmapWindow(Gtk.Window):
         context.set_source_rgb(0.0, 0.0, 0.0)
         context.paint()
         context.set_antialias(cairo.ANTIALIAS_BEST)
-
-        # Preserve 57% for the CPU heatmap. The right-hand 43% becomes three
-        # full-width landscape rows below a dedicated source-tab strip.
-        metrics_width = width * 0.43
-        heatmap_width = max(1.0, width - metrics_width)
-        tab_strip_height = min(48.0, height * 0.075)
-        metric_row_height = (height - tab_strip_height) / 3.0
-
-        cpu_count = len(self.displayed_loads)
-        columns, rows = choose_grid(cpu_count, int(heatmap_width), height)
-        cell_width = heatmap_width / columns
-        cell_height = height / rows
-        radius = min(cell_width, cell_height) * self.settings.circle_scale / 2.0
-
-        for index, load in enumerate(self.displayed_loads):
-            column = index % columns
-            row = index // columns
-            center_x = (column + 0.5) * cell_width
-            center_y = (row + 0.5) * cell_height
-            red, green, blue = heat_color(load)
-            context.set_source_rgb(red, green, blue)
-            context.arc(center_x, center_y, radius, 0.0, math.tau)
+        tabs, cpu_rect, metrics_rect = dashboard_regions(width, height)
+        self.draw_cpu_panel(context, *cpu_rect)
+        x, y, panel_width, panel_height = metrics_rect
+        row_height = panel_height / 3.0
+        for index, draw_panel in enumerate((
+            self.draw_memory_panel, self.draw_disk_panel, self.draw_network_panel
+        )):
+            row_y = y + index * row_height
+            context.save()
+            context.rectangle(x, row_y, panel_width, row_height)
+            context.clip()
+            draw_panel(context, x, row_y, panel_width, row_height)
+            context.restore()
+            context.set_source_rgb(0.35, 0.35, 0.35)
+            context.rectangle(x, row_y, panel_width, 1.0)
             context.fill()
-
-        context.set_source_rgb(0.16, 0.18, 0.23)
-        context.rectangle(heatmap_width, 0.0, 1.0, height)
-        context.rectangle(heatmap_width, tab_strip_height, metrics_width, 1.0)
-        context.rectangle(
-            heatmap_width,
-            tab_strip_height + metric_row_height,
-            metrics_width,
-            1.0,
-        )
-        context.rectangle(
-            heatmap_width,
-            tab_strip_height + metric_row_height * 2.0,
-            metrics_width,
-            1.0,
-        )
+        context.set_source_rgb(0.35, 0.35, 0.35)
+        context.rectangle(x, y, 1.0, panel_height)
+        context.rectangle(0.0, tabs, width, 1.0)
         context.fill()
-
-        self.draw_memory_panel(
-            context,
-            heatmap_width,
-            tab_strip_height,
-            metrics_width,
-            metric_row_height,
-        )
-        self.draw_disk_panel(
-            context,
-            heatmap_width,
-            tab_strip_height + metric_row_height,
-            metrics_width,
-            metric_row_height,
-        )
-        self.draw_network_panel(
-            context,
-            heatmap_width,
-            tab_strip_height + metric_row_height * 2.0,
-            metrics_width,
-            metric_row_height,
-        )
-        self.draw_source_tabs(context, heatmap_width, metrics_width, height)
-
+        self.draw_source_tabs(context, 0.0, width, tabs)
         return False
+
+    def draw_cpu_panel(
+        self, context: cairo.Context, x: float, y: float,
+        width: float, height: float,
+    ) -> None:
+        count = len(self.displayed_loads)
+        header_height = min(32.0, height * 0.15)
+        average = sum(self.displayed_loads) / count if count else 0.0
+        label = f"{count} LOGICAL CPUs  ·  {average:.0%} AVERAGE" if count else "CPU DATA UNAVAILABLE"
+        draw_visually_centered_text(
+            context, label, x + width / 2, y + header_height / 2,
+            min(16.0, header_height * 0.48), (0.45, 0.49, 0.58),
+            max_width=width * 0.94,
+        )
+        grid_height = max(1.0, height - header_height)
+        columns, rows = choose_grid(count, int(width), int(grid_height))
+        cell_width, cell_height = width / columns, grid_height / rows
+        radius = min(cell_width, cell_height) * self.settings.circle_scale / 2.0
+        for index, load in enumerate(self.displayed_loads):
+            row, column = divmod(index, columns)
+            # Center incomplete rows instead of leaving a gap on one side.
+            row_count = min(columns, count - row * columns)
+            offset = (width - row_count * cell_width) / 2.0
+            center_x = x + offset + (column + 0.5) * cell_width
+            center_y = y + header_height + (row + 0.5) * cell_height
+            context.set_source_rgb(*heat_color(load))
+            context.new_sub_path()
+            context.arc(center_x, center_y, radius, 0.0, math.tau)
+            context.fill_preserve()
+            context.set_source_rgb(0.20, 0.20, 0.20)
+            context.set_line_width(min(1.0, radius * 0.15))
+            context.stroke()
 
     def draw_usage_bar(
         self,
@@ -1026,7 +1079,7 @@ class HeatmapWindow(Gtk.Window):
         context: cairo.Context,
         panel_x: float,
         panel_width: float,
-        screen_height: float,
+        strip_height: float,
     ) -> None:
         remote_entries = self.remote_sources[-4:]
         if (
@@ -1046,13 +1099,13 @@ class HeatmapWindow(Gtk.Window):
 
         entries = [
             (self.local_source_key, f"LOCAL {self.local_hostname}"),
-            *remote_entries,
+            *((key, f"REMOTE {hostname}") for key, hostname in remote_entries),
         ]
-        tab_height = min(32.0, screen_height * 0.05)
-        tab_y = max(6.0, screen_height * 0.012)
+        tab_height = strip_height - 6.0
+        tab_y = 3.0
         font_size = min(15.0, tab_height * 0.46)
         available_width = max(1.0, panel_width - 24.0)
-        tab_width = min(180.0, available_width / len(entries))
+        tab_width = min(220.0, available_width / len(entries))
         start_x = panel_x + panel_width - 12.0 - tab_width * len(entries)
         self.source_tab_hitboxes = []
 
@@ -1060,24 +1113,25 @@ class HeatmapWindow(Gtk.Window):
             x = start_x + index * tab_width
             selected = source_key == self.active_source_key
             context.set_source_rgb(
-                *((0.065, 0.078, 0.115) if selected else (0.025, 0.028, 0.038))
+                *((0.16, 0.16, 0.16) if selected else (0.025, 0.028, 0.038))
             )
             context.rectangle(x + 1.0, tab_y, max(1.0, tab_width - 2.0), tab_height)
             context.fill()
             if selected:
-                context.set_source_rgb(*heat_color(0.44))
+                context.set_source_rgb(1.0, 1.0, 1.0)
                 context.rectangle(
                     x + 1.0, tab_y + tab_height - 2.0,
                     max(1.0, tab_width - 2.0), 2.0,
                 )
                 context.fill()
 
-            label = raw_label[:22]
+            label = raw_label
             draw_centered_text(
                 context, label, x + tab_width / 2.0,
                 tab_y + tab_height * 0.68, font_size,
-                (0.62, 0.66, 0.74) if selected else (0.36, 0.39, 0.46),
+                (0.92, 0.92, 0.92) if selected else (0.36, 0.39, 0.46),
                 cairo.FONT_WEIGHT_BOLD if selected else cairo.FONT_WEIGHT_NORMAL,
+                max_width=tab_width - 12.0, ellipsize=True,
             )
             self.source_tab_hitboxes.append(
                 (x, tab_y, tab_width, tab_height, source_key)
@@ -1091,9 +1145,10 @@ class HeatmapWindow(Gtk.Window):
         panel_width: float,
         panel_height: float,
     ) -> None:
-        label_size = min(24.0, panel_height * 0.10)
-        value_size = min(30.0, panel_height * 0.13)
-        detail_size = min(18.0, panel_height * 0.075)
+        text_height = min(panel_height, panel_width * 0.32)
+        label_size = min(24.0, text_height * 0.10)
+        value_size = min(30.0, text_height * 0.13)
+        detail_size = min(22.0, max(13.0, text_height * 0.10), panel_height * 0.14)
         label_x = panel_x + panel_width * 0.10
         value_x = panel_x + panel_width * 0.84
         bar_x = panel_x + panel_width * 0.20
@@ -1103,6 +1158,7 @@ class HeatmapWindow(Gtk.Window):
         draw_centered_text(
             context, "MEMORY", label_x, panel_y + panel_height * 0.31,
             label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.18,
         )
         self.draw_usage_bar(
             context, bar_x, panel_y + panel_height * 0.19, bar_width, bar_height,
@@ -1113,19 +1169,22 @@ class HeatmapWindow(Gtk.Window):
             context, f"{self.displayed_memory_usage * 100.0:.0f}%", value_x,
             panel_y + panel_height * 0.28, value_size, (0.55, 0.59, 0.68),
             cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.28,
         )
         draw_centered_text(
             context,
             format_memory_capacity(
                 self.displayed_memory_usage, self.memory_total_bytes
             ),
-            value_x, panel_y + panel_height * 0.44, detail_size,
-            (0.42, 0.46, 0.54),
+            bar_x + bar_width / 2.0, panel_y + panel_height * 0.52, detail_size,
+            (0.50, 0.54, 0.62),
+            max_width=bar_width,
         )
 
         draw_centered_text(
             context, "SWAP", label_x, panel_y + panel_height * 0.76,
             label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.18,
         )
         self.draw_usage_bar(
             context, bar_x, panel_y + panel_height * 0.64, bar_width, bar_height,
@@ -1133,17 +1192,20 @@ class HeatmapWindow(Gtk.Window):
             (0.065, 0.070, 0.082),
         )
         draw_centered_text(
-            context, f"{self.displayed_swap_usage * 100.0:.0f}%", value_x,
+            context, (f"{self.displayed_swap_usage * 100.0:.0f}%"
+                      if self.swap_total_bytes > 0 else "DISABLED"), value_x,
             panel_y + panel_height * 0.73, value_size, (0.55, 0.59, 0.68),
             cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.28,
         )
         draw_centered_text(
             context,
             format_memory_capacity(
                 self.displayed_swap_usage, self.swap_total_bytes
-            ),
-            value_x, panel_y + panel_height * 0.89, detail_size,
-            (0.42, 0.46, 0.54),
+            ) if self.swap_total_bytes > 0 else "NO SWAP",
+            bar_x + bar_width / 2.0, panel_y + panel_height * 0.97, detail_size,
+            (0.50, 0.54, 0.62),
+            max_width=bar_width,
         )
 
     def draw_disk_panel(
@@ -1154,11 +1216,12 @@ class HeatmapWindow(Gtk.Window):
         panel_width: float,
         panel_height: float,
     ) -> None:
-        label_size = min(24.0, panel_height * 0.10)
-        value_size = min(30.0, panel_height * 0.13)
-        detail_size = min(18.0, panel_height * 0.075)
-        small_size = min(15.0, panel_height * 0.063)
-        device_size = min(17.0, panel_height * 0.071)
+        text_height = min(panel_height, panel_width * 0.32)
+        label_size = min(24.0, text_height * 0.10)
+        value_size = min(30.0, text_height * 0.13)
+        detail_size = min(22.0, max(13.0, text_height * 0.10), panel_height * 0.14)
+        small_size = min(18.0, max(12.0, text_height * 0.085), panel_height * 0.13)
+        device_size = min(21.0, max(13.0, text_height * 0.095), panel_height * 0.14)
         label_x = panel_x + panel_width * 0.10
         bar_x = panel_x + panel_width * 0.20
         bar_width = panel_width * 0.34
@@ -1171,21 +1234,25 @@ class HeatmapWindow(Gtk.Window):
         draw_visually_centered_text(
             context, "DISK I/O", label_x, bar_center_y,
             label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.18,
         )
         self.draw_usage_bar(
             context, bar_x, bar_y, bar_width,
-            bar_height, self.displayed_disk_usage,
+            bar_height, (self.displayed_disk_usage if self.disk_usage_available else 0.0),
             bar_heat_color(self.displayed_disk_usage), (0.065, 0.070, 0.082),
         )
         draw_visually_centered_text(
-            context, f"{self.displayed_disk_usage * 100.0:.0f}%",
+            context, (f"{self.displayed_disk_usage * 100.0:.0f}%"
+                      if self.disk_usage_available else "—"),
             panel_x + panel_width * 0.59, bar_center_y,
             value_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.08,
         )
 
         draw_visually_centered_text(
             context, "FILESYSTEM", label_x, filesystem_bar_center_y,
             label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.18,
         )
         self.draw_usage_bar(
             context, bar_x, filesystem_bar_y, bar_width,
@@ -1202,6 +1269,7 @@ class HeatmapWindow(Gtk.Window):
             context, filesystem_text,
             panel_x + panel_width * 0.59, filesystem_bar_center_y,
             value_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.08,
         )
 
         for title, rate, center_ratio in (
@@ -1212,19 +1280,23 @@ class HeatmapWindow(Gtk.Window):
             draw_centered_text(
                 context, title, center_x, panel_y + panel_height * 0.34,
                 small_size, (0.40, 0.44, 0.52), cairo.FONT_WEIGHT_BOLD,
+                max_width=panel_width * 0.15,
             )
             draw_centered_text(
-                context, format_disk_rate(rate), center_x,
+                context, (format_disk_rate(rate) if self.disk_usage_available else "—"), center_x,
                 panel_y + panel_height * 0.57, detail_size,
                 (0.52, 0.56, 0.65), cairo.FONT_WEIGHT_BOLD,
+                max_width=panel_width * 0.15,
             )
 
         draw_centered_text(
-            context, self.disk_device_name,
+            context, (self.disk_device_name if self.disk_usage_available
+                      else f"I/O unavailable · {self.disk_device_name}"),
             panel_x + panel_width * 0.82,
             panel_y + panel_height * 0.86,
             device_size,
-            (0.32, 0.37, 0.46),
+            (0.50, 0.54, 0.62),
+            max_width=panel_width * 0.32, ellipsize=True,
         )
 
     def draw_network_panel(
@@ -1235,10 +1307,11 @@ class HeatmapWindow(Gtk.Window):
         panel_width: float,
         panel_height: float,
     ) -> None:
-        label_size = min(24.0, panel_height * 0.10)
-        rate_size = min(44.0, panel_height * 0.18)
+        text_height = min(panel_height, panel_width * 0.32)
+        label_size = min(24.0, text_height * 0.10)
+        rate_size = min(44.0, text_height * 0.18)
         link_rate_size = rate_size * 0.72
-        device_size = min(17.0, panel_height * 0.071)
+        device_size = min(21.0, max(13.0, text_height * 0.095), panel_height * 0.14)
         upload_color = network_heat_color(
             self.displayed_upload, self.effective_link_capacity
         )
@@ -1254,28 +1327,32 @@ class HeatmapWindow(Gtk.Window):
             draw_centered_text(
                 context, title, center_x, panel_y + panel_height * 0.36,
                 label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.28,
             )
             draw_centered_text(
                 context, format_bit_rate(rate), center_x,
                 panel_y + panel_height * 0.64, rate_size, color,
                 cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.28,
             )
 
         # The three footer values intentionally share one size, color, and
         # baseline so they read as a single aligned network-status row.
         footer_y = panel_y + panel_height * 0.86
-        footer_color = (0.32, 0.37, 0.46)
+        footer_color = (0.50, 0.54, 0.62)
         tcp_text = "TCP —" if self.tcp_connections is None else f"TCP {self.tcp_connections}"
         udp_text = "UDP —" if self.udp_sockets is None else f"UDP {self.udp_sockets}"
         draw_centered_text(
             context, tcp_text,
             panel_x + panel_width * 0.18, footer_y,
             device_size, footer_color,
+            max_width=panel_width * 0.28,
         )
         draw_centered_text(
             context, udp_text,
             panel_x + panel_width * 0.50, footer_y,
             device_size, footer_color,
+            max_width=panel_width * 0.28,
         )
 
         link_center_x = panel_x + panel_width * 0.82
@@ -1284,19 +1361,24 @@ class HeatmapWindow(Gtk.Window):
             context, "LINK SPEED", link_center_x,
             panel_y + panel_height * 0.36, label_size,
             (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.28,
         )
         draw_centered_text(
             context, format_link_speed(self.negotiated_link_capacity),
             link_center_x, panel_y + panel_height * 0.64, link_rate_size,
             (0.50, 0.50, 0.50), cairo.FONT_WEIGHT_BOLD,
+            max_width=panel_width * 0.28,
         )
         draw_centered_text(
             context, interface, link_center_x, footer_y,
             device_size, footer_color,
+            max_width=panel_width * 0.28, ellipsize=True,
         )
 
     def place_on_output(self) -> bool:
-        if self.settings.windowed or self.placed_output:
+        if self.settings.windowed or not self.sway_environment.get("SWAYSOCK"):
+            return False
+        if self.placed_output:
             return True
 
         outputs = sway_outputs(self.sway_environment)

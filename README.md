@@ -10,19 +10,21 @@ enforce landscape orientation, remove borders, and enter fullscreen.
 
 ## Screen layout
 
-The left 57% is an adaptive grid of per-vCPU circles. The right 43% contains
-three equal-height landscape rows:
+Source tabs occupy a dedicated strip across the top. Wide windows place the
+CPU heatmap on the left and three metric rows on the right. The metric area
+normally occupies 43%, with extra room reserved in smaller landscape windows.
+Narrow and portrait windows stack the CPU heatmap above the metric rows.
+Layout dimensions use GTK logical pixels, so they follow desktop scaling.
 
-```text
-┌──────────────────────────────┬──────────────────────────────────┐
-│                              │ MEMORY [usage]  %  used/total GB │
-│                              │ SWAP   [usage]  %  used/total GB │
-│       per-vCPU heatmap       ├──────────────────────────────────┤
-│                              │ DISK I/O [busy] READ/WRITE MB/s  │
-│                              ├──────────────────────────────────┤
-│                              │ UPLINK / DOWNLINK / LINK SPEED   │
-└──────────────────────────────┴──────────────────────────────────┘
-```
+The CPU grid maximizes circle size rather than insisting on completely filled
+rows; prime counts such as 7 or 13 remain compact. Incomplete rows are centered,
+idle CPUs have faint outlines, and a header shows the logical CPU count and
+average load. The grid is recalculated when the window or CPU count changes,
+including when switching between remote machines.
+
+Text is fitted to its column. Long source, device, and interface names are
+ellipsized; large capacities and rates use TB, GB/s, and Gbps where appropriate.
+Very small windows still reduce text size; use a larger window for readability.
 
 Every live measurement uses the same black, blue, purple, crimson, and red
 heat palette. Faint one-pixel separators define the regions, and unused
@@ -31,6 +33,8 @@ capacity in proportional bars uses a subtle neutral background.
 ## Features
 
 - Discovers all logical CPUs dynamically and adapts the circle grid.
+- Reflows between side-by-side and stacked layouts as the window changes.
+- Fits long Linux device/interface names and remote hostnames to their columns.
 - Samples CPU and system counters every 50 ms and renders at 60 FPS.
 - Applies time-based interpolation instead of abrupt visual jumps.
 - Shows RAM and swap as proportional heat bars with used/total decimal GB.
@@ -143,6 +147,19 @@ the root device has outstanding work, while throughput shows the data volume.
 Modern multiqueue NVMe performance cannot be fully characterized by either
 value alone.
 
+Systems without swap show `DISABLED`. When root block-device counters are
+unavailable (for example, an overlay root), disk I/O shows dashes and an
+`I/O unavailable` label instead of implying the device is idle. Filesystem
+capacity remains independent. Remote agents include an optional `disk.available`
+flag; update the agent on remote hosts to obtain this distinction. Older agents
+continue displaying their reported values.
+
+Windowed mode uses desktop window decorations for resizing. Automatic output
+placement still requires Sway/Xwayland; the launcher still selects X11. On
+another desktop, run `./start-dashboard.sh --windowed` as the logged-in desktop
+user with a working X11/Xwayland session. Native Wayland launching, IPv6-only
+default-route detection, and container CPU quota reporting are not implemented.
+
 ## Remote measurements
 
 By default the dashboard listens on TCP port `9177` on all local addresses.
@@ -153,7 +170,7 @@ seconds, the dashboard automatically returns to local measurements.
 
 Clickable source tabs at the top-right identify and select the active machine.
 The local tab is always present, and up to four fresh remote hostnames appear
-beside it in a dedicated strip above the measurement rows. The selected tab is
+beside it in a dedicated strip across the top of the dashboard. The selected tab is
 highlighted; press `Tab` or `Shift+Tab` to cycle without a pointer. The network
 footer shows the selected source's interface.
 Automatic selection remains on one remote source until it disconnects rather
@@ -228,7 +245,10 @@ Run the non-GUI checks:
 ```
 
 This validates both shell scripts, compiles the Python source, and runs the
-built-in parser, formatting, heat-color, and layout assertions.
+built-in parser, formatting, and heat-color assertions. Headless Cairo rendering
+checks cover landscape and portrait windows, long labels, source-tab clicks,
+and CPU counts up to 4096. Set `DASHBOARD_PREVIEW_DIR=/tmp/dashboard-previews`
+when running `./check.sh` to save representative PNG renders.
 
 ## Repository contents
 
@@ -237,6 +257,7 @@ live_performance_dashboard.py  Dashboard application
 start-dashboard.sh             Portable Xwayland/Sway launcher
 remote_metrics_agent.py        Standard-library remote measurement agent
 check.sh                       Non-GUI validation
+test_layout.py                 Headless layout and rendering regressions
 dependencies-debian.txt        Debian-family runtime packages
 systemd/                       Remote agent service and configuration template
 README.md                      Setup, operation, and design notes
