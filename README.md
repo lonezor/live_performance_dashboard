@@ -122,13 +122,16 @@ options, including sampling rate, frame rate, smoothing, and circle size.
 
 ## Output selection
 
-Without `--output`, the application waits until at least two active Sway
-outputs are present. It prefers an active 1920×720 output, then a non-focused
-secondary output. The selected output is changed to `transform normal` for
-landscape orientation before the application enters fullscreen.
+Without `--output`, the application uses the 1920×720 wide panel in fullscreen
+when available. Otherwise it tiles on the main monitor (HDMI-A-1), falling back
+to the focused output if that connector is unavailable. Placement is checked
+periodically, so connecting or disconnecting the wide panel updates placement.
+`--output` selects a fullscreen target explicitly; `--windowed` disables placement.
 
-If only one output exists, the dashboard remains windowed and periodically
-retries placement. `--windowed` disables automatic moving and fullscreen mode.
+The installed Sway header has a **Dashboard OFF/ON** button immediately left of
+volume. Left-click to launch or close the dashboard. It is off at login and is
+not autostarted. The button reflects the actual window, including closing with
+`Esc` or `q`.
 
 ## Network and disk interpretation
 
@@ -163,8 +166,9 @@ default-route detection, and container CPU quota reporting are not implemented.
 ## Remote measurements
 
 By default the dashboard listens on TCP port `9177` on all local addresses.
-Local measurements remain active until a valid remote snapshot arrives. Fresh
-remote data replaces the complete dashboard source, including CPU count,
+The dashboard always starts with LOCAL selected and keeps showing local
+measurements until you select a remote source tab. Selected remote data
+replaces the complete dashboard source, including CPU count,
 memory, swap, disk, and network measurements. If no snapshot arrives for two
 seconds, the dashboard automatically returns to local measurements.
 
@@ -173,8 +177,8 @@ The local tab is always present, and up to four fresh remote hostnames appear
 beside it in a dedicated strip across the top of the dashboard. The selected tab is
 highlighted; press `Tab` or `Shift+Tab` to cycle without a pointer. The network
 footer shows the selected source's interface.
-Automatic selection remains on one remote source until it disconnects rather
-than alternating between concurrently reporting machines.
+The selected source remains active until you choose another tab or it
+disconnects; incoming remote data never changes the startup LOCAL selection.
 Listener options are:
 
 ```text

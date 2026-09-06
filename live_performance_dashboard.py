@@ -711,9 +711,6 @@ def choose_target_output(outputs: Sequence[dict], requested: Optional[str]) -> O
     if requested:
         return next((output for output in outputs if output.get("name") == requested), None)
 
-    if len(outputs) < 2:
-        return None
-
     # Prefer the planned ultrawide panel regardless of connector name.
     for output in outputs:
         rect = output.get("rect", {})
@@ -723,8 +720,7 @@ def choose_target_output(outputs: Sequence[dict], requested: Optional[str]) -> O
         if width == 1920 and height == 720:
             return output
 
-    # Otherwise use a non-focused display as the natural secondary output.
-    return next((output for output in outputs if not output.get("focused")), outputs[-1])
+    return None
 
 
 @dataclass
@@ -802,11 +798,12 @@ class HeatmapWindow(Gtk.Window):
         self.source_hostname = self.local_hostname
         self.local_source_key = f"local:{self.local_hostname}"
         self.active_source_key = self.local_source_key
-        self.selected_source_key: Optional[str] = None
+        # Start on LOCAL and stay there until the user selects a remote tab.
+        self.selected_source_key: str = self.local_source_key
         self.remote_sources: List[Tuple[str, str]] = []
         self.source_tab_hitboxes: List[Tuple[float, float, float, float, str]] = []
         self.last_frame_time = time.monotonic()
-        self.placed_output: Optional[str] = None
+        self.placed_output: Optional[Tuple[str, bool]] = None
 
         self.sway_environment = os.environ.copy()
         sway_socket = discover_sway_socket()
@@ -898,8 +895,8 @@ class HeatmapWindow(Gtk.Window):
         active_remotes: List[Tuple[str, Dict[str, object], float]] = []
         if self.remote_server is not None:
             active_remotes = self.remote_server.active(self.settings.remote_timeout)
-        # Packet timestamps select the freshest source, but must never move
-        # tabs or change the keyboard navigation order on every sample.
+        # Packet arrival order must never move tabs or change the keyboard
+        # navigation order on every sample.
         self.remote_sources = sorted(
             ((key, str(snapshot["hostname"]))
              for key, snapshot, _ in active_remotes),
@@ -915,14 +912,6 @@ class HeatmapWindow(Gtk.Window):
                 self.apply_remote_snapshot(self.selected_source_key, selected_remote)
                 return True
             self.selected_source_key = self.local_source_key
-        elif self.selected_source_key is None and active_remotes:
-            if self.active_source_key in remote_by_key:
-                source_key = self.active_source_key
-                snapshot = remote_by_key[source_key]
-            else:
-                source_key, snapshot, _ = active_remotes[-1]
-            self.apply_remote_snapshot(source_key, snapshot)
-            return True
 
         sampled = self.sampler.sample()
         self.set_cpu_targets(sampled)
@@ -1027,6 +1016,9 @@ class HeatmapWindow(Gtk.Window):
         self, context: cairo.Context, x: float, y: float,
         width: float, height: float,
     ) -> None:
+        top_margin = min(10.0, height * 0.03)
+        y += top_margin
+        height -= top_margin
         count = len(self.displayed_loads)
         header_height = min(32.0, height * 0.15)
         average = sum(self.displayed_loads) / count if count else 0.0
@@ -1101,6 +1093,10 @@ class HeatmapWindow(Gtk.Window):
             (self.local_source_key, f"LOCAL {self.local_hostname}"),
             *((key, f"REMOTE {hostname}") for key, hostname in remote_entries),
         ]
+        # Match the Sway bar background (#323232) across the full header.
+        context.set_source_rgb(50 / 255, 50 / 255, 50 / 255)
+        context.rectangle(panel_x, 0.0, panel_width, strip_height)
+        context.fill()
         tab_height = strip_height - 6.0
         tab_y = 3.0
         font_size = min(15.0, tab_height * 0.46)
@@ -1112,11 +1108,6 @@ class HeatmapWindow(Gtk.Window):
         for index, (source_key, raw_label) in enumerate(entries):
             x = start_x + index * tab_width
             selected = source_key == self.active_source_key
-            context.set_source_rgb(
-                *((0.16, 0.16, 0.16) if selected else (0.025, 0.028, 0.038))
-            )
-            context.rectangle(x + 1.0, tab_y, max(1.0, tab_width - 2.0), tab_height)
-            context.fill()
             if selected:
                 context.set_source_rgb(1.0, 1.0, 1.0)
                 context.rectangle(
@@ -1129,7 +1120,7 @@ class HeatmapWindow(Gtk.Window):
             draw_centered_text(
                 context, label, x + tab_width / 2.0,
                 tab_y + tab_height * 0.68, font_size,
-                (0.92, 0.92, 0.92) if selected else (0.36, 0.39, 0.46),
+                (0.92, 0.92, 0.92) if selected else (0.62, 0.64, 0.68),
                 cairo.FONT_WEIGHT_BOLD if selected else cairo.FONT_WEIGHT_NORMAL,
                 max_width=tab_width - 12.0, ellipsize=True,
             )
@@ -1378,43 +1369,41 @@ class HeatmapWindow(Gtk.Window):
     def place_on_output(self) -> bool:
         if self.settings.windowed or not self.sway_environment.get("SWAYSOCK"):
             return False
-        if self.placed_output:
-            return True
-
         outputs = sway_outputs(self.sway_environment)
         target = choose_target_output(outputs, self.settings.output)
+        fullscreen = target is not None
+        if not target and not self.settings.output:
+            target = next((o for o in outputs if o.get("name") == "HDMI-A-1"),
+                          next((o for o in outputs if o.get("focused")),
+                               outputs[0] if outputs else None))
         if not target:
             return True
 
         output_name = str(target["name"]).replace('"', "")
-        criteria = '[class="^LivePerformanceDashboard$"]'
-        commands = (
+        placement = (output_name, fullscreen)
+        if self.placed_output == placement:
+            return True
+        criteria = f'[pid={os.getpid()} class="^LivePerformanceDashboard$"]'
+        commands = [
+            f"{criteria} fullscreen disable",
+            f"{criteria} floating disable",
             f'{criteria} move container to output "{output_name}"',
-            f"{criteria} border none",
-            f"{criteria} fullscreen enable",
-        )
+            f"{criteria} border {'none' if fullscreen else 'normal'}",
+            f"{criteria} fullscreen {'enable' if fullscreen else 'disable'}",
+        ]
+        if fullscreen:
+            commands.insert(0, f'output "{output_name}" transform normal')
         try:
-            # Keep the heatmap panel in its native wide landscape orientation.
-            subprocess.run(
-                ["swaymsg", "output", output_name, "transform", "normal"],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=self.sway_environment,
-                timeout=2,
-            )
             for command in commands:
-                subprocess.run(
-                    ["swaymsg", command],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    env=self.sway_environment,
-                    timeout=2,
+                result = subprocess.run(
+                    ["swaymsg", "-r", command], check=True, capture_output=True,
+                    text=True, env=self.sway_environment, timeout=2,
                 )
-            self.placed_output = output_name
-            print(f"Heatmap placed fullscreen on {output_name}", flush=True)
-        except (OSError, subprocess.SubprocessError):
+                if not all(reply.get("success") for reply in json.loads(result.stdout)):
+                    return True
+            self.placed_output = placement
+            print(f"Dashboard placed {'fullscreen' if fullscreen else 'tiled'} on {output_name}", flush=True)
+        except (OSError, subprocess.SubprocessError, ValueError):
             pass
         return True
 
