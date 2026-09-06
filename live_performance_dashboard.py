@@ -1140,25 +1140,27 @@ class HeatmapWindow(Gtk.Window):
         label_size = min(24.0, text_height * 0.10)
         value_size = min(30.0, text_height * 0.13)
         detail_size = min(22.0, max(13.0, text_height * 0.10), panel_height * 0.14)
+        # Leave breathing room below the swap capacity, above the divider.
+        content_height = panel_height - min(20.0, panel_height * 0.10)
         label_x = panel_x + panel_width * 0.10
         value_x = panel_x + panel_width * 0.84
         bar_x = panel_x + panel_width * 0.20
         bar_width = panel_width * 0.47
-        bar_height = panel_height * 0.20
+        bar_height = content_height * 0.20
 
         draw_centered_text(
-            context, "MEMORY", label_x, panel_y + panel_height * 0.31,
+            context, "MEMORY", label_x, panel_y + content_height * 0.31,
             label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
             max_width=panel_width * 0.18,
         )
         self.draw_usage_bar(
-            context, bar_x, panel_y + panel_height * 0.19, bar_width, bar_height,
+            context, bar_x, panel_y + content_height * 0.19, bar_width, bar_height,
             self.displayed_memory_usage, bar_heat_color(self.displayed_memory_usage),
             (0.065, 0.070, 0.082),
         )
         draw_centered_text(
             context, f"{self.displayed_memory_usage * 100.0:.0f}%", value_x,
-            panel_y + panel_height * 0.28, value_size, (0.55, 0.59, 0.68),
+            panel_y + content_height * 0.28, value_size, (0.55, 0.59, 0.68),
             cairo.FONT_WEIGHT_BOLD,
             max_width=panel_width * 0.28,
         )
@@ -1167,25 +1169,25 @@ class HeatmapWindow(Gtk.Window):
             format_memory_capacity(
                 self.displayed_memory_usage, self.memory_total_bytes
             ),
-            bar_x + bar_width / 2.0, panel_y + panel_height * 0.52, detail_size,
+            bar_x + bar_width / 2.0, panel_y + content_height * 0.52, detail_size,
             (0.50, 0.54, 0.62),
             max_width=bar_width,
         )
 
         draw_centered_text(
-            context, "SWAP", label_x, panel_y + panel_height * 0.76,
+            context, "SWAP", label_x, panel_y + content_height * 0.76,
             label_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
             max_width=panel_width * 0.18,
         )
         self.draw_usage_bar(
-            context, bar_x, panel_y + panel_height * 0.64, bar_width, bar_height,
+            context, bar_x, panel_y + content_height * 0.64, bar_width, bar_height,
             self.displayed_swap_usage, bar_heat_color(self.displayed_swap_usage),
             (0.065, 0.070, 0.082),
         )
         draw_centered_text(
             context, (f"{self.displayed_swap_usage * 100.0:.0f}%"
                       if self.swap_total_bytes > 0 else "DISABLED"), value_x,
-            panel_y + panel_height * 0.73, value_size, (0.55, 0.59, 0.68),
+            panel_y + content_height * 0.73, value_size, (0.55, 0.59, 0.68),
             cairo.FONT_WEIGHT_BOLD,
             max_width=panel_width * 0.28,
         )
@@ -1194,7 +1196,7 @@ class HeatmapWindow(Gtk.Window):
             format_memory_capacity(
                 self.displayed_swap_usage, self.swap_total_bytes
             ) if self.swap_total_bytes > 0 else "NO SWAP",
-            bar_x + bar_width / 2.0, panel_y + panel_height * 0.97, detail_size,
+            bar_x + bar_width / 2.0, panel_y + content_height * 0.97, detail_size,
             (0.50, 0.54, 0.62),
             max_width=bar_width,
         )
