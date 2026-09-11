@@ -105,7 +105,7 @@ class LayoutTests(unittest.TestCase):
             tcp_connections=1234567, udp_sockets=None,
             network_interface_name='enp123s456f789-long-interface-name',
         )
-        for name in ('draw_cpu_panel', 'draw_memory_panel', 'draw_disk_panel', 'draw_network_panel', 'draw_source_tabs', 'draw_usage_bar', 'on_canvas_click'):
+        for name in ('draw_cpu_panel', 'draw_memory_panel', 'draw_disk_panel', 'draw_network_panel', 'draw_source_tabs', 'draw_usage_bar', 'usage_bar_colors', 'on_canvas_click'):
             setattr(window, name, MethodType(getattr(dashboard.HeatmapWindow, name), window))
         for width, height, count in ((1920, 720, 7), (1920, 1080, 127), (960, 360, 4), (800, 600, 13), (480, 800, 64), (320, 480, 256), (1920, 720, 4096)):
             for available in (False, True):

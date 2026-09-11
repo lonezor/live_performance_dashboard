@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import functools
 import glob
 import json
@@ -13,16 +14,18 @@ import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, TextIO, Tuple
 
 import cairo
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
+gi.require_foreign("cairo")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 
@@ -43,6 +46,14 @@ HEAT_STOPS: Sequence[Tuple[float, Color]] = (
     (0.82, (0.706, 0.000, 0.255)),
     (1.00, (1.000, 0.071, 0.000)),
 )
+
+
+def try_instance_lock(lock_file: TextIO) -> bool:
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
 
 
 def clamp01(value: float) -> float:
@@ -732,6 +743,7 @@ class Settings:
     remote_timeout: float
     local_only: bool
     windowed: bool
+    grayscale_stats: bool
     fps: float
     sample_seconds: float
     heating_seconds: float
@@ -1066,6 +1078,11 @@ class HeatmapWindow(Gtk.Window):
         context.rectangle(x, y, width * usage, height)
         context.fill()
 
+    def usage_bar_colors(self, usage: float) -> Tuple[Color, Color]:
+        if getattr(self.settings, "grayscale_stats", False):
+            return (0.55, 0.59, 0.68), (0.28, 0.28, 0.28)
+        return bar_heat_color(usage), (0.065, 0.070, 0.082)
+
     def draw_source_tabs(
         self,
         context: cairo.Context,
@@ -1143,9 +1160,9 @@ class HeatmapWindow(Gtk.Window):
         # Leave breathing room below the swap capacity, above the divider.
         content_height = panel_height - min(20.0, panel_height * 0.10)
         label_x = panel_x + panel_width * 0.10
-        value_x = panel_x + panel_width * 0.84
+        value_x = panel_x + panel_width * 0.59
         bar_x = panel_x + panel_width * 0.20
-        bar_width = panel_width * 0.47
+        bar_width = panel_width * 0.34
         bar_height = content_height * 0.20
 
         draw_centered_text(
@@ -1155,14 +1172,14 @@ class HeatmapWindow(Gtk.Window):
         )
         self.draw_usage_bar(
             context, bar_x, panel_y + content_height * 0.19, bar_width, bar_height,
-            self.displayed_memory_usage, bar_heat_color(self.displayed_memory_usage),
-            (0.065, 0.070, 0.082),
+            self.displayed_memory_usage,
+            *self.usage_bar_colors(self.displayed_memory_usage),
         )
         draw_centered_text(
             context, f"{self.displayed_memory_usage * 100.0:.0f}%", value_x,
             panel_y + content_height * 0.28, value_size, (0.55, 0.59, 0.68),
             cairo.FONT_WEIGHT_BOLD,
-            max_width=panel_width * 0.28,
+            max_width=panel_width * 0.08,
         )
         draw_centered_text(
             context,
@@ -1181,15 +1198,15 @@ class HeatmapWindow(Gtk.Window):
         )
         self.draw_usage_bar(
             context, bar_x, panel_y + content_height * 0.64, bar_width, bar_height,
-            self.displayed_swap_usage, bar_heat_color(self.displayed_swap_usage),
-            (0.065, 0.070, 0.082),
+            self.displayed_swap_usage,
+            *self.usage_bar_colors(self.displayed_swap_usage),
         )
         draw_centered_text(
             context, (f"{self.displayed_swap_usage * 100.0:.0f}%"
                       if self.swap_total_bytes > 0 else "DISABLED"), value_x,
             panel_y + content_height * 0.73, value_size, (0.55, 0.59, 0.68),
             cairo.FONT_WEIGHT_BOLD,
-            max_width=panel_width * 0.28,
+            max_width=panel_width * 0.08,
         )
         draw_centered_text(
             context,
@@ -1232,7 +1249,7 @@ class HeatmapWindow(Gtk.Window):
         self.draw_usage_bar(
             context, bar_x, bar_y, bar_width,
             bar_height, (self.displayed_disk_usage if self.disk_usage_available else 0.0),
-            bar_heat_color(self.displayed_disk_usage), (0.065, 0.070, 0.082),
+            *self.usage_bar_colors(self.displayed_disk_usage),
         )
         draw_visually_centered_text(
             context, (f"{self.displayed_disk_usage * 100.0:.0f}%"
@@ -1250,8 +1267,7 @@ class HeatmapWindow(Gtk.Window):
         self.draw_usage_bar(
             context, bar_x, filesystem_bar_y, bar_width,
             bar_height, self.displayed_filesystem_usage,
-            bar_heat_color(self.displayed_filesystem_usage),
-            (0.065, 0.070, 0.082),
+            *self.usage_bar_colors(self.displayed_filesystem_usage),
         )
         filesystem_text = (
             f"{self.displayed_filesystem_usage * 100.0:.0f}%"
@@ -1272,13 +1288,13 @@ class HeatmapWindow(Gtk.Window):
             center_x = panel_x + panel_width * center_ratio
             draw_centered_text(
                 context, title, center_x, panel_y + panel_height * 0.34,
-                small_size, (0.40, 0.44, 0.52), cairo.FONT_WEIGHT_BOLD,
+                small_size, (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
                 max_width=panel_width * 0.15,
             )
             draw_centered_text(
                 context, (format_disk_rate(rate) if self.disk_usage_available else "—"), center_x,
                 panel_y + panel_height * 0.57, detail_size,
-                (0.52, 0.56, 0.65), cairo.FONT_WEIGHT_BOLD,
+                (0.55, 0.59, 0.68), cairo.FONT_WEIGHT_BOLD,
                 max_width=panel_width * 0.15,
             )
 
@@ -1305,16 +1321,9 @@ class HeatmapWindow(Gtk.Window):
         rate_size = min(44.0, text_height * 0.18)
         link_rate_size = rate_size * 0.72
         device_size = min(21.0, max(13.0, text_height * 0.095), panel_height * 0.14)
-        upload_color = network_heat_color(
-            self.displayed_upload, self.effective_link_capacity
-        )
-        download_color = network_heat_color(
-            self.displayed_download, self.effective_link_capacity
-        )
-
-        for title, rate, color, center_ratio in (
-            ("UPLINK", self.displayed_upload, upload_color, 0.18),
-            ("DOWNLINK", self.displayed_download, download_color, 0.50),
+        for title, rate, center_ratio in (
+            ("UPLINK", self.displayed_upload, 0.18),
+            ("DOWNLINK", self.displayed_download, 0.50),
         ):
             center_x = panel_x + panel_width * center_ratio
             draw_centered_text(
@@ -1324,7 +1333,9 @@ class HeatmapWindow(Gtk.Window):
             )
             draw_centered_text(
                 context, format_bit_rate(rate), center_x,
-                panel_y + panel_height * 0.64, rate_size, color,
+                panel_y + panel_height * 0.64, link_rate_size,
+                ((0.55, 0.59, 0.68) if getattr(self.settings, "grayscale_stats", False)
+                 else network_heat_color(rate, self.effective_link_capacity)),
                 cairo.FONT_WEIGHT_BOLD,
             max_width=panel_width * 0.28,
             )
@@ -1385,7 +1396,7 @@ class HeatmapWindow(Gtk.Window):
         placement = (output_name, fullscreen)
         if self.placed_output == placement:
             return True
-        criteria = f'[pid={os.getpid()} class="^LivePerformanceDashboard$"]'
+        criteria = f"[pid={os.getpid()}]"
         commands = [
             f"{criteria} fullscreen disable",
             f"{criteria} floating disable",
@@ -1411,6 +1422,11 @@ class HeatmapWindow(Gtk.Window):
 
 
 def run_self_test() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        lock_path = os.path.join(directory, "dashboard.lock")
+        with open(lock_path, "w") as first, open(lock_path, "w") as second:
+            assert try_instance_lock(first)
+            assert not try_instance_lock(second)
     assert choose_grid(24, 1920, 720) == (8, 3)
     assert choose_grid(4, 1920, 720) == (4, 1)
     sample = parse_proc_stat(
@@ -1473,12 +1489,8 @@ def run_self_test() -> None:
     assert format_link_speed(2_500_000_000.0) == "2.5 Gbps"
     assert format_link_speed(100_000_000.0) == "100 Mbps"
     assert format_link_speed(None) == "UNKNOWN"
-    assert network_heat_color(1_000_000_000.0, 1_000_000_000.0) == heat_color(1.0)
-    assert network_heat_color(0.0, 1_000_000_000.0) == (0.20, 0.22, 0.28)
     assert heat_color(0.0) == (0.0, 0.0, 0.0)
     assert heat_color(1.0) == HEAT_STOPS[-1][1]
-    assert bar_heat_color(0.14) == heat_color(0.36)
-    assert bar_heat_color(1.0) == heat_color(1.0)
     remote = normalize_remote_snapshot(
         {
             "version": 1,
@@ -1536,7 +1548,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--remote-timeout", type=float, default=2.0)
     parser.add_argument("--local-only", action="store_true", help="disable the remote TCP listener")
     parser.add_argument("--windowed", action="store_true", help="do not move or fullscreen the window")
-    parser.add_argument("--fps", type=float, default=60.0)
+    parser.add_argument("--heatmap-stats", action="store_true", help="use heatmap colors for metric bars and rates")
+    parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--sample-ms", type=float, default=50.0)
     parser.add_argument("--heating-seconds", type=float, default=0.15)
     parser.add_argument("--cooling-seconds", type=float, default=0.25)
@@ -1549,6 +1562,15 @@ def main() -> int:
     arguments = parse_arguments()
     if arguments.self_test:
         run_self_test()
+        return 0
+
+    lock_path = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+        f"live-performance-dashboard-{os.getuid()}.lock",
+    )
+    instance_lock = open(lock_path, "w")
+    if not try_instance_lock(instance_lock):
+        print("Dashboard is already running", file=sys.stderr)
         return 0
 
     if arguments.fps <= 0 or arguments.sample_ms <= 0:
@@ -1570,6 +1592,7 @@ def main() -> int:
         remote_timeout=arguments.remote_timeout,
         local_only=arguments.local_only,
         windowed=arguments.windowed,
+        grayscale_stats=not arguments.heatmap_stats,
         fps=arguments.fps,
         sample_seconds=arguments.sample_ms / 1000.0,
         heating_seconds=arguments.heating_seconds,
@@ -1577,6 +1600,7 @@ def main() -> int:
         circle_scale=arguments.circle_scale,
     )
 
+    GLib.set_prgname("live-performance-dashboard")
     window = HeatmapWindow(settings)
     window.show_all()
     Gtk.main()

@@ -4,9 +4,10 @@ A fullscreen Linux system dashboard designed for a wide secondary display
 under Sway. It combines a per-vCPU heatmap with live memory, swap, root-disk,
 and default-route network measurements.
 
-The interface is rendered with GTK 3 and Cairo. It runs as an X11 application
-through Xwayland and uses Sway IPC to move itself to the selected output,
-enforce landscape orientation, remove borders, and enter fullscreen.
+The interface is rendered with GTK 3 and Cairo. It runs natively under Wayland
+when available, falls back to X11 through Xwayland, and uses Sway IPC to move
+itself to the selected output, enforce landscape orientation, remove borders,
+and enter fullscreen.
 
 ## Screen layout
 
@@ -26,16 +27,17 @@ Text is fitted to its column. Long source, device, and interface names are
 ellipsized; large capacities and rates use TB, GB/s, and Gbps where appropriate.
 Very small windows still reduce text size; use a larger window for readability.
 
-Every live measurement uses the same black, blue, purple, crimson, and red
-heat palette. Faint one-pixel separators define the regions, and unused
-capacity in proportional bars uses a subtle neutral background.
+The CPU heatmap uses black, blue, purple, crimson, and red. Metric panels use
+low-contrast gray bars and rates by default; use `--heatmap-stats` for color
+metrics. Faint one-pixel separators define the regions, and unused capacity in
+proportional bars uses a subtle neutral background.
 
 ## Features
 
 - Discovers all logical CPUs dynamically and adapts the circle grid.
 - Reflows between side-by-side and stacked layouts as the window changes.
 - Fits long Linux device/interface names and remote hostnames to their columns.
-- Samples CPU and system counters every 50 ms and renders at 60 FPS.
+- Samples CPU and system counters every 50 ms and renders at 30 FPS.
 - Applies time-based interpolation instead of abrupt visual jumps.
 - Shows RAM and swap as proportional heat bars with used/total decimal GB.
 - Shows root-disk busy time, synchronized read/write MB/s, and proportional
@@ -78,7 +80,7 @@ On Debian, Ubuntu, or Raspberry Pi OS:
 
 ```sh
 sudo apt update
-sudo apt install python3 python3-gi python3-cairo gir1.2-gtk-3.0 sway xwayland util-linux
+sudo apt install python3 python3-gi python3-cairo python3-gi-cairo gir1.2-gtk-3.0 sway xwayland util-linux
 ```
 
 The package names are also listed in `dependencies-debian.txt`.
@@ -117,6 +119,12 @@ Run in a normal window on the current display:
 ./start-dashboard.sh --windowed
 ```
 
+Use color metric bars and rates:
+
+```sh
+./start-dashboard.sh --windowed --heatmap-stats
+```
+
 Press `Esc` or `q` to exit. Run `./start-dashboard.sh --help` for all tuning
 options, including sampling rate, frame rate, smoothing, and circle size.
 
@@ -128,10 +136,16 @@ to the focused output if that connector is unavailable. Placement is checked
 periodically, so connecting or disconnecting the wide panel updates placement.
 `--output` selects a fullscreen target explicitly; `--windowed` disables placement.
 
-The installed Sway header has a **Dashboard OFF/ON** button immediately left of
-volume. Left-click to launch or close the dashboard. It is off at login and is
-not autostarted. The button reflects the actual window, including closing with
-`Esc` or `q`.
+To add a **Dashboard OFF/ON** button immediately left of the clock, replace the
+`status_command` in your Sway `bar` block with the absolute path to:
+
+```text
+/path/to/live_performance_dashboard/start-dashboard.sh --swaybar
+```
+
+Then reload Sway. Left-click the button to launch or close the dashboard. It is
+off at login and is not autostarted. The button reflects the actual window,
+including closing with `Esc` or `q`.
 
 ## Network and disk interpretation
 
@@ -157,11 +171,11 @@ capacity remains independent. Remote agents include an optional `disk.available`
 flag; update the agent on remote hosts to obtain this distinction. Older agents
 continue displaying their reported values.
 
-Windowed mode uses desktop window decorations for resizing. Automatic output
-placement still requires Sway/Xwayland; the launcher still selects X11. On
-another desktop, run `./start-dashboard.sh --windowed` as the logged-in desktop
-user with a working X11/Xwayland session. Native Wayland launching, IPv6-only
-default-route detection, and container CPU quota reporting are not implemented.
+Windowed mode uses desktop window decorations for resizing and lets Sway tile
+the window normally. Automatic output placement requires Sway. On another
+desktop, run `./start-dashboard.sh --windowed` as the logged-in desktop user
+with a working Wayland or X11 session. IPv6-only default-route detection and
+container CPU quota reporting are not implemented.
 
 ## Remote measurements
 
@@ -187,6 +201,49 @@ Listener options are:
 --remote-timeout SECONDS   Default: 2
 --local-only               Disable remote reception
 ```
+
+### Connecting a remote dashboard client
+
+The dashboard prints a message such as:
+
+```text
+Listening for remote metrics on 0.0.0.0:9177
+```
+
+This means the main dashboard program accepts TCP connections on port `9177`
+on every local interface. A remote metrics agent normally connects to that
+listener, so set its endpoint to the dashboard computer's reachable address:
+
+```sh
+./remote_metrics_agent.py --dashboard DASHBOARD_HOST:9177
+```
+
+When VPN routing or firewall rules prevent the remote host from reaching the
+dashboard directly, use an SSH reverse tunnel. Run this on the computer
+running the dashboard, replacing the placeholders with the SSH account and
+remote host:
+
+```sh
+ssh -NT \
+  -o ExitOnForwardFailure=yes \
+  -R 127.0.0.1:9177:127.0.0.1:9177 \
+  REMOTE_USER@REMOTE_HOST
+```
+
+Then configure the remote agent to use `127.0.0.1:9177`:
+
+```sh
+./remote_metrics_agent.py --dashboard 127.0.0.1:9177
+```
+
+The `-R` option makes the SSH server (the remote host) listen on its own
+loopback address at port `9177`. Connections there travel through SSH to the
+dashboard computer's loopback address, where the dashboard is listening on
+`0.0.0.0:9177`. `-N` keeps the SSH session for forwarding only, `-T` disables
+terminal allocation, and `ExitOnForwardFailure` reports a tunnel that could
+not be established. Keep the SSH process running while metrics are needed.
+This is often useful with VPNs when the VPN makes the dashboard's address
+unreachable from the remote host, or when direct port `9177` access is blocked.
 
 Test a remote machine interactively by copying this repository there and
 running:
@@ -259,6 +316,7 @@ when running `./check.sh` to save representative PNG renders.
 ```text
 live_performance_dashboard.py  Dashboard application
 start-dashboard.sh             Portable Xwayland/Sway launcher
+sway_dashboard_bar.py          Swaybar Dashboard toggle and clock
 remote_metrics_agent.py        Standard-library remote measurement agent
 check.sh                       Non-GUI validation
 test_layout.py                 Headless layout and rendering regressions
